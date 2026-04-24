@@ -441,25 +441,25 @@ def answer(q, adf, fdf):
         appr={"Prior Auth/Appeal":int(cdf["text_lower"].apply(lambda x: mtch(x,["prior auth","appeal","peer to peer"])).sum()),"Patient Assistance":int(cdf["text_lower"].apply(lambda x: mtch(x,["patient assistance","patient support","patient program"])).sum()),"Manufacturer Programs":int(cdf["text_lower"].apply(lambda x: mtch(x,["manufacturer","company","free drug"])).sum()),"Copay Support":int(cdf["text_lower"].apply(lambda x: mtch(x,["copay","co-pay"])).sum()),"Office/Pharmacist":int(cdf["text_lower"].apply(lambda x: mtch(x,["my office","pharmacist","staff"])).sum())}
         res["summary"]=f"**{cn} of {T} respondents ({round(cn/T*100) if T else 0}%)** discussed cost/insurance."
         res["chart"]={"Reimbursement Approaches":dict(sorted(appr.items(),key=lambda x:-x[1]))}
-        res["rows"]=cdf.to_dict("records"); res["export"]=[{"ID":r["id"],"Setting":r["setting"],"Specialty":r["specialty"],"Full Response":r["text"]} for r in res["rows"]]
+        res["rows"]=cdf.to_dict("records"); res["export"]=[{"ID":r["id"],"Setting":r["setting"],"Target":r.get("target",""),"Specialty":r["specialty"],"Full Response":r["text"]} for r in res["rows"]]
     elif itn=="seizure":
         sdf=fdf[fdf["text_lower"].apply(lambda x: mtch(x,THEMES["Seizures"]))]
         sn=len(sdf); pos=int(sdf["text_lower"].apply(lambda x: any(p in x for p in ["reduc","decreas","lower","control","fewer","less"])).sum()); neg=int(sdf["text_lower"].apply(lambda x: any(p in x for p in ["trigger","worsen","increase","risk","not primary"])).sum())
         res["summary"]=f"**{sn} of {T} respondents** discussed seizures. **{pos} benefit** · **{neg} concern**."
         res["chart"]={"Seizure Sentiment":{"Benefit":pos,"Concern":neg,"Neutral":max(0,sn-pos-neg)}}
-        res["rows"]=sdf.to_dict("records"); res["export"]=[{"ID":r["id"],"Setting":r["setting"],"Specialty":r["specialty"],"Full Response":r["text"]} for r in res["rows"]]
+        res["rows"]=sdf.to_dict("records"); res["export"]=[{"ID":r["id"],"Setting":r["setting"],"Target":r.get("target",""),"Specialty":r["specialty"],"Full Response":r["text"]} for r in res["rows"]]
     elif itn=="endpoint":
         pn=int(fdf["text_lower"].apply(lambda x: mtch(x,THEMES["PFS"])).sum()); on=int(fdf["text_lower"].apply(lambda x: mtch(x,THEMES["OS"])).sum()); bn=int(fdf["text_lower"].apply(lambda x: mtch(x,THEMES["PFS"]) and mtch(x,THEMES["OS"])).sum())
         res["summary"]=f"**PFS**: {pn} ({round(pn/T*100) if T else 0}%) · **OS**: {on} ({round(on/T*100) if T else 0}%) · **Both**: {bn}"
         res["chart"]={"Endpoint Split":{"PFS":pn,"OS":on,"Both":bn}}
         res["rows"]=fdf[fdf["text_lower"].apply(lambda x: mtch(x,THEMES["PFS"]))].to_dict("records")
-        res["export"]=[{"ID":r["id"],"Setting":r["setting"],"Specialty":r["specialty"],"Full Response":r["text"]} for r in res["rows"]]
+        res["export"]=[{"ID":r["id"],"Setting":r["setting"],"Target":r.get("target",""),"Specialty":r["specialty"],"Full Response":r["text"]} for r in res["rows"]]
     elif itn=="radiation":
         rdf=fdf[fdf["text_lower"].apply(lambda x: mtch(x,THEMES["Radiation Delay"]))]; rn=len(rdf)
         why={"Cognitive Preservation":int(rdf["text_lower"].apply(lambda x: any(p in x for p in ["cognitive","neurocognit","brain fog","dementia"])).sum()),"Long-term Side Effects":int(rdf["text_lower"].apply(lambda x: "long term" in x or "long-term" in x).sum()),"Fertility":int(rdf["text_lower"].apply(lambda x: mtch(x,THEMES["Fertility"])).sum()),"Quality of Life":int(rdf["text_lower"].apply(lambda x: mtch(x,THEMES["Quality of Life"])).sum()),"Younger Patients":int(rdf["text_lower"].apply(lambda x: any(p in x for p in ["young","younger","less than 40"])).sum())}
         res["summary"]=f"**{rn} of {T} respondents** cited delaying radiation/chemo as a benefit."
         res["chart"]={"Why Delay Radiation":dict(sorted(why.items(),key=lambda x:-x[1]))}
-        res["rows"]=rdf.to_dict("records"); res["export"]=[{"ID":r["id"],"Setting":r["setting"],"Specialty":r["specialty"],"Full Response":r["text"]} for r in res["rows"]]
+        res["rows"]=rdf.to_dict("records"); res["export"]=[{"ID":r["id"],"Setting":r["setting"],"Target":r.get("target",""),"Specialty":r["specialty"],"Full Response":r["text"]} for r in res["rows"]]
     elif itn=="patient":
         ch={"IDH1/IDH2 Mutant":int(fdf["text_lower"].apply(lambda x: mtch(x,THEMES["IDH Mutation"])).sum()),"Grade 2 Disease":int(fdf["text_lower"].apply(lambda x: "grade 2" in x or "grade two" in x).sum()),"Residual/Recurring":int(fdf["text_lower"].apply(lambda x: any(p in x for p in ["residual tumor","residual disease","recurring"])).sum()),"Good Performance Status":int(fdf["text_lower"].apply(lambda x: any(p in x for p in ["performance status","ecog","kps"])).sum()),"Younger Patients":int(fdf["text_lower"].apply(lambda x: any(p in x for p in ["young","younger","less than 40"])).sum())}
         res["summary"]=f"Patient characteristics across {T} respondents:"
@@ -469,7 +469,7 @@ def answer(q, adf, fdf):
         bdf=mdf[mdf["text_lower"].apply(lambda x: any(p in x for p in bp))] if nm>0 else mdf
         res["summary"]=f"**{len(bdf)} respondents** expressed barriers around {tstr}."
         res["chart"]={"Barrier Drivers":dict(sorted(d_counts(bdf).items(),key=lambda x:-x[1])[:8])}
-        res["rows"]=bdf.to_dict("records"); res["export"]=[{"ID":r["id"],"Setting":r["setting"],"Specialty":r["specialty"],"Full Response":r["text"]} for r in res["rows"]]
+        res["rows"]=bdf.to_dict("records"); res["export"]=[{"ID":r["id"],"Setting":r["setting"],"Target":r.get("target",""),"Specialty":r["specialty"],"Full Response":r["text"]} for r in res["rows"]]
     else:
         res["summary"]=f"**{nm} of {T} respondents ({pct}%)** discussed {tstr}."
         res["chart"]={"Themes Found":dict(sorted({t:v for t,v in t_counts(mdf).items() if v>0}.items(),key=lambda x:-x[1])[:10])}
@@ -649,7 +649,7 @@ if query and query.strip():
             st.markdown(f'<div class="card"><div class="sec-lbl" style="color:#10b981">RESPONDENTS MENTIONING BOTH — FULL RESPONSES WITH ALL THEMES HIGHLIGHTED</div><div style="font-size:11px;color:#4a6080;margin-bottom:12px">Both <b style="color:{ca}">{ta}</b> and <b style="color:{cb}">{tb}</b> highlighted. Full text, no truncation.</div>', unsafe_allow_html=True)
             for row in co["rows"][:5]: quote_card(row, [ta,tb])
             st.markdown('</div>', unsafe_allow_html=True)
-            rows=[{"ID":rec["id"],"Setting":rec["setting"],"Specialty":rec["specialty"],"Full Response":rec["text"]} for rec in co["rows"]]
+            rows=[{"ID":rec["id"],"Setting":rec["setting"],"Target":rec.get("target",""),"Specialty":rec["specialty"],"Full Response":rec["text"]} for rec in co["rows"]]
             st.download_button("⬇ Download co-occurrence CSV", pd.DataFrame(rows).to_csv(index=False).encode(),"co_occurrence.csv","text/csv")
 
     # ── CLUSTER ───────────────────────────────────────────────────────────
@@ -716,7 +716,8 @@ if query and query.strip():
         if r.get("export"):
             st.markdown("<hr>", unsafe_allow_html=True)
             dfe=pd.DataFrame(r["export"])
-            st.dataframe(dfe[["ID","Setting","Specialty","Target"]].head(20),hide_index=True,use_container_width=True)
+            preview_cols=[c for c in ["ID","Setting","Specialty","Target"] if c in dfe.columns]
+            st.dataframe(dfe[preview_cols].head(20) if preview_cols else dfe.head(20),hide_index=True,use_container_width=True)
             st.download_button("⬇ Download full responses CSV", dfe.to_csv(index=False).encode(),f"responses_{query[:20].replace(' ','_')}.csv","text/csv")
 
 else:
