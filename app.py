@@ -617,7 +617,7 @@ def render_dashboard(theme, full_df):
         disp = theme_df if filter_s == "All" else theme_df[theme_df["setting"] == filter_s]
         st.markdown(f'<div style="font-size:11px;color:#4a6080;margin-bottom:12px">Showing {len(disp)} respondents. Full verbatim text, all themes colour-highlighted.</div>', unsafe_allow_html=True)
         for _, row in disp.iterrows():
-            quote_card(row, focus_themes=[theme])
+            quote_card(row, focus=[theme])
 
     with tab3:
         export_rows = []
