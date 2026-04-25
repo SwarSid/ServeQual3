@@ -538,6 +538,517 @@ def build_exec_summary(theme, theme_df, full_df, seg_data):
     return points
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SENTIMENT ENGINE — context-aware, pharma-tuned, zero hallucination
+# Every classification traced to exact sentence + trigger words
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Positive signals — HCP pharma language
+SENT_POSITIVE = [
+    "good efficacy","great efficacy","excellent efficacy","strong efficacy",
+    "impressive data","impressive results","impressive benefit",
+    "well tolerated","good tolerability","favorable profile","favorable side effect",
+    "manageable","no significant side","minimal side","low toxicity","low side",
+    "confident","comfortable prescribing","happy to prescribe","prefer",
+    "proven benefit","proven efficacy","clear benefit","significant benefit",
+    "significant improvement","meaningful improvement",
+    "easy to use","easy to administer","convenient","simple",
+    "good quality of life","improved quality","maintain quality",
+    "delay radiation","delay chemo","avoid radiation","avoid chemo","defer radiation",
+    "targeted therapy","precise","specific","rational",
+    "no issues","no problem","no concern","no barrier","no challenge",
+    "no reimbursement issue","covered","approved","on formulary",
+    "patients do well","patients respond","patients benefit",
+    "supports","support","endorse","recommend","choose","select",
+    "first choice","go to","standard","routine",
+    "promising","encouraging","positive data","positive results",
+    "effective","efficacious","works well","good outcomes",
+]
+
+# Negative signals — HCP pharma language
+SENT_NEGATIVE = [
+    "concern","concerned about","worry","worried","hesitant","hesitation",
+    "reluctant","reluctance","not comfortable","uncomfortable",
+    "barrier","obstacle","challenge","difficult","difficulty",
+    "issue with","problem with","limitation","limited by",
+    "uncertain","uncertainty","unclear","not sure","unsure","not confident",
+    "adverse event","toxicity concern","side effect concern","toxicity issue",
+    "not tolerated","poorly tolerated","intolerable","significant toxicity",
+    "insurance denial","denied","prior auth","reimbursement challenge",
+    "access issue","affordability","can't afford","too expensive","high cost",
+    "not covered","formulary issue","off formulary",
+    "don't prescribe","do not prescribe","avoid prescribing","rarely prescribe",
+    "not appropriate","inappropriate","not indicated","not eligible",
+    "liver dysfunction","hepatotoxicity","liver concern",
+    "fertility concern","birth defect","pregnancy concern",
+    "not durable","short duration","limited duration",
+    "os data missing","no os data","os not available","overall survival not",
+    "still early","not enough data","insufficient data","limited data",
+    "patient refuses","patient reluctant","patient concern",
+    "not first choice","second choice","last resort",
+]
+
+# Negation prefixes — flip negative to positive when present before trigger
+NEGATION_PREFIXES = [
+    "no ", "not ", "never ", "without ", "don't have ", "do not have ",
+    "doesn't have ", "does not have ", "no significant ", "no major ",
+    "haven't seen ", "have not seen ", "eliminates ", "removes ", "resolves ",
+    "no longer ", "absence of ", "free of ", "free from ",
+]
+
+# Context words that make negative words POSITIVE (e.g. "delay radiation" = good)
+POSITIVE_CONTEXT_OVERRIDE = {
+    "delay": ["radiation","chemo","chemotherapy","radiotherapy","alkylat","rt","surgery"],
+    "avoid": ["radiation","chemo","chemotherapy","toxicity","side effect","hospitalization"],
+    "prevent": ["progression","recurrence","relapse","tumor growth","seizure"],
+    "reduce": ["seizure","tumor","progression","side effect","toxicity","risk"],
+    "eliminate": ["disease","tumor","progression"],
+    "control": ["seizure","tumor","disease","symptom"],
+    "protect": ["cognition","fertility","quality","brain"],
+}
+
+
+def classify_sentence_sentiment(sentence):
+    """
+    Classify a single sentence.
+    Returns: (sentiment, pos_triggers, neg_triggers, confidence)
+    sentiment: POSITIVE / NEGATIVE / MIXED / NEUTRAL
+    confidence: HIGH / MEDIUM / LOW
+    """
+    sl = sentence.lower()
+
+    pos_hits = []
+    neg_hits = []
+
+    # ── Check positive signals ────────────────────────────────────────────
+    for sig in SENT_POSITIVE:
+        if sig in sl:
+            pos_hits.append(sig)
+
+    # ── Check negative signals with negation detection ────────────────────
+    for sig in SENT_NEGATIVE:
+        if sig in sl:
+            # Check if a negation prefix appears before this signal
+            sig_idx = sl.find(sig)
+            prefix_window = sl[max(0, sig_idx-25):sig_idx]
+            negated = any(neg in prefix_window for neg in NEGATION_PREFIXES)
+            if negated:
+                # Negated negative = positive signal
+                pos_hits.append(f"no {sig}")
+            else:
+                neg_hits.append(sig)
+
+    # ── Context override — certain words are positive in pharma context ────
+    for word, contexts in POSITIVE_CONTEXT_OVERRIDE.items():
+        if word in sl:
+            if any(ctx in sl for ctx in contexts):
+                # This is a positive usage (e.g. "delay radiation")
+                # Remove from neg_hits if it was added
+                neg_hits = [h for h in neg_hits if word not in h]
+                if word + " (positive context)" not in pos_hits:
+                    pos_hits.append(word + " (positive context)")
+
+    # Deduplicate
+    pos_hits = list(dict.fromkeys(pos_hits))[:3]
+    neg_hits = list(dict.fromkeys(neg_hits))[:3]
+
+    # ── Classify ──────────────────────────────────────────────────────────
+    if pos_hits and neg_hits:
+        sentiment = "MIXED"
+        confidence = "HIGH" if (len(pos_hits) >= 2 or len(neg_hits) >= 2) else "MEDIUM"
+    elif pos_hits:
+        sentiment = "POSITIVE"
+        confidence = "HIGH" if len(pos_hits) >= 2 else "MEDIUM"
+    elif neg_hits:
+        sentiment = "NEGATIVE"
+        confidence = "HIGH" if len(neg_hits) >= 2 else "MEDIUM"
+    else:
+        sentiment = "NEUTRAL"
+        confidence = "LOW"
+
+    return sentiment, pos_hits, neg_hits, confidence
+
+
+def run_sentiment_analysis(theme, full_df, theme_filter=None):
+    """
+    Run sentence-level sentiment analysis on SPEAKER_B responses
+    for respondents who mentioned the given theme.
+    Returns structured results with full traceability.
+    """
+    pats = THEMES.get(theme, [theme.lower()]) if theme != "ALL" else []
+
+    # Filter to relevant respondents
+    if pats:
+        rel_df = full_df[full_df["text_lower"].apply(lambda x: any(p in x for p in pats))]
+    else:
+        rel_df = full_df
+
+    results = []  # one entry per classified sentence
+
+    for _, row in rel_df.iterrows():
+        text = str(row.get("text", ""))
+        # Split into sentences
+        sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if len(s.strip()) > 20]
+
+        for sent in sents:
+            # Only classify sentences that reference the theme (or all if no theme)
+            sl = sent.lower()
+            theme_relevant = True
+            if pats:
+                theme_relevant = any(p in sl for p in pats)
+
+            sentiment, pos_hits, neg_hits, confidence = classify_sentence_sentiment(sent)
+
+            # Detect which themes appear in this sentence
+            sent_themes = [t for t, tp in THEMES.items() if any(p in sl for p in tp)]
+
+            results.append({
+                "id": row["id"],
+                "setting": row["setting"],
+                "specialty": row["specialty"],
+                "target": row.get("target", ""),
+                "sentence": sent,
+                "sentiment": sentiment,
+                "pos_triggers": pos_hits,
+                "neg_triggers": neg_hits,
+                "confidence": confidence,
+                "theme_relevant": theme_relevant,
+                "sentence_themes": sent_themes,
+            })
+
+    # Aggregate counts
+    theme_sents = [r for r in results if r["theme_relevant"]]
+    total_sents = len(theme_sents)
+
+    counts = {"POSITIVE": 0, "NEGATIVE": 0, "MIXED": 0, "NEUTRAL": 0}
+    for r in theme_sents:
+        counts[r["sentiment"]] += 1
+
+    # Per-segment breakdown
+    seg_sentiment = {}
+    for col in ["setting", "specialty", "target"]:
+        seg_sentiment[col] = {}
+        vals = set(r[col] for r in theme_sents if r[col])
+        for val in vals:
+            val_sents = [r for r in theme_sents if r[col] == val]
+            vt = len(val_sents)
+            seg_sentiment[col][val] = {
+                "total": vt,
+                "pos": sum(1 for r in val_sents if r["sentiment"] == "POSITIVE"),
+                "neg": sum(1 for r in val_sents if r["sentiment"] == "NEGATIVE"),
+                "mixed": sum(1 for r in val_sents if r["sentiment"] == "MIXED"),
+                "neutral": sum(1 for r in val_sents if r["sentiment"] == "NEUTRAL"),
+            }
+
+    # Top positive and negative sentences
+    pos_examples = sorted([r for r in theme_sents if r["sentiment"] == "POSITIVE"],
+                          key=lambda x: len(x["pos_triggers"]), reverse=True)[:5]
+    neg_examples = sorted([r for r in theme_sents if r["sentiment"] == "NEGATIVE"],
+                          key=lambda x: len(x["neg_triggers"]), reverse=True)[:5]
+    mixed_examples = [r for r in theme_sents if r["sentiment"] == "MIXED"][:4]
+
+    # Most common triggers
+    all_pos_triggers = []
+    all_neg_triggers = []
+    for r in theme_sents:
+        all_pos_triggers.extend(r["pos_triggers"])
+        all_neg_triggers.extend(r["neg_triggers"])
+
+    from collections import Counter
+    top_pos_triggers = dict(Counter(all_pos_triggers).most_common(8))
+    top_neg_triggers = dict(Counter(all_neg_triggers).most_common(8))
+
+    return {
+        "theme": theme,
+        "n_respondents": len(rel_df),
+        "total_sentences": total_sents,
+        "counts": counts,
+        "seg_sentiment": seg_sentiment,
+        "pos_examples": pos_examples,
+        "neg_examples": neg_examples,
+        "mixed_examples": mixed_examples,
+        "top_pos_triggers": top_pos_triggers,
+        "top_neg_triggers": top_neg_triggers,
+        "all_results": theme_sents,
+    }
+
+
+def render_sentiment_tab(theme, full_df):
+    """Render the sentiment analysis tab inside the dashboard."""
+    with st.spinner("Running sentence-level sentiment analysis..."):
+        sa = run_sentiment_analysis(theme, full_df)
+
+    T_sents = sa["total_sentences"]
+    if T_sents == 0:
+        st.warning(f"No sentences referencing {theme} found.")
+        return
+
+    counts = sa["counts"]
+
+    # ── Overall sentiment split ───────────────────────────────────────────
+    st.markdown('<div class="sec-lbl">OVERALL SENTIMENT SPLIT — SENTENCE LEVEL</div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="font-size:11px;color:#4a6080;margin-bottom:14px">Based on {T_sents} sentences referencing <b style="color:#e2ecf8">{theme}</b> across {sa["n_respondents"]} respondents. Each sentence classified independently. Every classification backed by trigger words from the text.</div>', unsafe_allow_html=True)
+
+    # Stat cards
+    c1,c2,c3,c4 = st.columns(4)
+    card_configs = [
+        ("✅ POSITIVE", counts["POSITIVE"], "#10b981", "Favourable language about this theme"),
+        ("❌ NEGATIVE", counts["NEGATIVE"], "#ef4444", "Concern, barrier, hesitation language"),
+        ("🔀 MIXED", counts["MIXED"], "#f59e0b", "Both positive & negative in same sentence"),
+        ("⬜ NEUTRAL", counts["NEUTRAL"], "#64748b", "Clinical/factual — no evaluative language"),
+    ]
+    for col, (label, count, color, desc) in zip([c1,c2,c3,c4], card_configs):
+        pct = round(count/T_sents*100) if T_sents else 0
+        col.markdown(f'''<div class="card" style="text-align:center;border-left:3px solid {color}">
+            <div style="font-size:11px;color:{color};font-weight:600;margin-bottom:4px">{label}</div>
+            <div class="stat-num" style="color:{color};font-size:32px">{count}</div>
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#e2ecf8;margin-top:2px">{pct}%</div>
+            <div style="font-size:9px;color:#4a6080;margin-top:4px">{desc}</div>
+        </div>''', unsafe_allow_html=True)
+
+    # ── Net Sentiment Score ──────────────────────────────────────────────
+    pos_n  = counts["POSITIVE"]
+    neg_n  = counts["NEGATIVE"]
+    mix_n  = counts["MIXED"]
+    neu_n  = counts["NEUTRAL"]
+    total_mentions = pos_n + neg_n + neu_n  # denominator per formula
+    nss = round((pos_n - neg_n) / total_mentions * 100, 1) if total_mentions > 0 else 0
+    nss_color  = "#10b981" if nss > 10 else "#ef4444" if nss < -10 else "#f59e0b"
+    nss_label  = "Net positive" if nss > 10 else "Net negative" if nss < -10 else "Balanced"
+    nss_interp = (
+        f"More positive than negative sentiment on {theme}. Doctors broadly favour this topic."
+        if nss > 10 else
+        f"More negative than positive sentiment on {theme}. Concerns outweigh favourable mentions."
+        if nss < -10 else
+        f"Balanced sentiment on {theme}. Positive and negative mentions are roughly equal."
+    )
+    st.markdown(f'''<div class="card" style="border-left:4px solid {nss_color};margin-top:4px">
+        <div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap">
+            <div style="text-align:center;min-width:100px">
+                <div style="font-size:10px;color:{nss_color};font-weight:600;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px">Net Sentiment Score</div>
+                <div style="font-family:'IBM Plex Mono',monospace;font-size:42px;font-weight:700;color:{nss_color};line-height:1">{nss:+.1f}</div>
+                <div style="font-size:11px;color:{nss_color};margin-top:2px">{nss_label}</div>
+            </div>
+            <div style="flex:1;min-width:200px">
+                <div style="font-size:12px;color:#e2ecf8;line-height:1.6;margin-bottom:8px">{nss_interp}</div>
+                <div style="font-size:11px;color:#4a6080;line-height:1.6">
+                    <b style="color:#8a9ab5">Formula:</b> (Positive − Negative) ÷ Total Mentions × 100<br>
+                    <b style="color:#8a9ab5">Where:</b> Total Mentions = Positive ({pos_n}) + Negative ({neg_n}) + Neutral ({neu_n})<br>
+                    <b style="color:#8a9ab5">Excludes:</b> Mixed sentences from denominator to avoid double-counting
+                </div>
+            </div>
+            <div style="text-align:center;min-width:140px">
+                <div style="font-size:10px;color:#4a6080;margin-bottom:6px">Score interpretation</div>
+                <div style="font-size:11px;line-height:1.9">
+                    <span style="color:#10b981">▲ &gt; +10</span> — Net positive<br>
+                    <span style="color:#f59e0b">● −10 to +10</span> — Balanced<br>
+                    <span style="color:#ef4444">▼ &lt; −10</span> — Net negative
+                </div>
+            </div>
+        </div>
+    </div>''', unsafe_allow_html=True)
+
+    # Sentiment bar
+    st.markdown("<br>", unsafe_allow_html=True)
+    pos_pct = round(counts["POSITIVE"]/T_sents*100) if T_sents else 0
+    neg_pct = round(counts["NEGATIVE"]/T_sents*100) if T_sents else 0
+    mix_pct = round(counts["MIXED"]/T_sents*100) if T_sents else 0
+    neu_pct = 100 - pos_pct - neg_pct - mix_pct
+
+    st.markdown(f'''<div style="margin-bottom:20px">
+        <div style="font-size:11px;color:#4a6080;margin-bottom:6px">Sentiment distribution across {T_sents} sentences</div>
+        <div style="display:flex;height:20px;border-radius:4px;overflow:hidden;gap:2px">
+            <div style="width:{pos_pct}%;background:#10b981;display:flex;align-items:center;justify-content:center">
+                <span style="font-size:9px;color:white;font-weight:600">{pos_pct}%</span></div>
+            <div style="width:{neg_pct}%;background:#ef4444;display:flex;align-items:center;justify-content:center">
+                <span style="font-size:9px;color:white;font-weight:600">{neg_pct}%</span></div>
+            <div style="width:{mix_pct}%;background:#f59e0b;display:flex;align-items:center;justify-content:center">
+                <span style="font-size:9px;color:white;font-weight:600">{mix_pct}%</span></div>
+            <div style="flex:1;background:#334155;display:flex;align-items:center;justify-content:center">
+                <span style="font-size:9px;color:#94a3b8;font-weight:600">{neu_pct}%</span></div>
+        </div>
+        <div style="display:flex;gap:16px;margin-top:6px">
+            <span style="font-size:10px;color:#10b981">■ Positive</span>
+            <span style="font-size:10px;color:#ef4444">■ Negative</span>
+            <span style="font-size:10px;color:#f59e0b">■ Mixed</span>
+            <span style="font-size:10px;color:#64748b">■ Neutral</span>
+        </div>
+    </div>''', unsafe_allow_html=True)
+
+    # ── Segment breakdown ─────────────────────────────────────────────────
+    st.markdown('<div class="sec-lbl">SENTIMENT BY SEGMENT</div>', unsafe_allow_html=True)
+    seg_cols = st.columns(3)
+    for col_w, (seg_key, seg_label) in zip(seg_cols, [("setting","Practice Setting"),("specialty","Specialty"),("target","Target Type")]):
+        with col_w:
+            seg_data = sa["seg_sentiment"].get(seg_key, {})
+            if not seg_data:
+                continue
+            st.markdown(f'<div class="card"><div class="sec-lbl">{seg_label}</div>', unsafe_allow_html=True)
+            for val, d in sorted(seg_data.items(), key=lambda x: -(x[1]["pos"]+x[1]["neg"])):
+                vt = d["total"]
+                if vt == 0: continue
+                p = round(d["pos"]/vt*100)
+                n = round(d["neg"]/vt*100)
+                m = round(d["mixed"]/vt*100)
+                st.markdown(f'''<div style="margin-bottom:12px">
+                    <div style="font-size:11px;color:#e2ecf8;font-weight:500;margin-bottom:4px">{val[:30]}</div>
+                    <div style="display:flex;height:10px;border-radius:3px;overflow:hidden;gap:1px">
+                        <div style="width:{p}%;background:#10b981"></div>
+                        <div style="width:{n}%;background:#ef4444"></div>
+                        <div style="width:{m}%;background:#f59e0b"></div>
+                        <div style="flex:1;background:#1e293b"></div>
+                    </div>
+                    <div style="display:flex;gap:8px;margin-top:3px;font-size:9px;font-family:'IBM Plex Mono',monospace;flex-wrap:wrap">
+                        <span style="color:#10b981">+{p}%</span>
+                        <span style="color:#ef4444">-{n}%</span>
+                        <span style="color:#f59e0b">±{m}%</span>
+                        <span style="color:#4a6080">{vt} sent.</span>
+                        <span style="color:{nss_c};font-weight:700">NSS:{seg_nss:+.0f}</span>
+                    </div>
+                </div>''', unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Trigger word analysis ─────────────────────────────────────────────
+    lc, rc = st.columns(2)
+    with lc:
+        st.markdown('<div class="card"><div class="sec-lbl" style="color:#10b981">TOP POSITIVE TRIGGER WORDS</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:10px">Words/phrases that drove positive classification — from actual sentences in uploaded data</div>', unsafe_allow_html=True)
+        for trigger, cnt in sa["top_pos_triggers"].items():
+            st.markdown(f'''<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid #1a2640">
+                <span style="font-size:12px;color:#e2ecf8;font-style:italic">"{trigger}"</span>
+                <span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#10b981">{cnt}x</span>
+            </div>''', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with rc:
+        st.markdown('<div class="card"><div class="sec-lbl" style="color:#ef4444">TOP NEGATIVE TRIGGER WORDS</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:10px">Words/phrases that drove negative classification — from actual sentences in uploaded data</div>', unsafe_allow_html=True)
+        for trigger, cnt in sa["top_neg_triggers"].items():
+            st.markdown(f'''<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid #1a2640">
+                <span style="font-size:12px;color:#e2ecf8;font-style:italic">"{trigger}"</span>
+                <span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#ef4444">{cnt}x</span>
+            </div>''', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Verbatim evidence by sentiment ────────────────────────────────────
+    for sent_type, examples, color, icon, label in [
+        ("POSITIVE", sa["pos_examples"], "#10b981", "✅", "POSITIVE SENTENCES — what drives favourable sentiment"),
+        ("NEGATIVE", sa["neg_examples"], "#ef4444", "❌", "NEGATIVE SENTENCES — what drives concern or hesitation"),
+        ("MIXED", sa["mixed_examples"], "#f59e0b", "🔀", "MIXED SENTENCES — both favourable and concern language"),
+    ]:
+        if not examples:
+            continue
+        st.markdown(f'<div class="card"><div class="sec-lbl" style="color:{color}">{icon} {label}</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:12px">Full sentences from uploaded data. Trigger words shown below each quote.</div>', unsafe_allow_html=True)
+        for ex in examples:
+            is_comm = "COMMUNITY" in ex["setting"].upper() or "PRIVATE" in ex["setting"].upper()
+            border_color = "#f59e0b" if is_comm else "#3b6ef7"
+            seg_badge = f'<span class="seg-a">{ex["setting"][:20]}</span>' if is_comm else f'<span class="seg-b">{ex["setting"][:20]}</span>'
+            # Highlight trigger words in sentence
+            h_sent = ex["sentence"]
+            for trg in ex["pos_triggers"] + ex["neg_triggers"]:
+                clean_trg = trg.replace(" (positive context)", "")
+                h_sent = re.sub(f'({re.escape(clean_trg)})',
+                               f'<span style="background:{color}33;padding:1px 3px;border-radius:3px;color:{color};font-weight:600">\\1</span>',
+                               h_sent, flags=re.IGNORECASE, count=1)
+            triggers_html = ""
+            if ex["pos_triggers"]:
+                triggers_html += f'<span style="font-size:9px;color:#10b981">✅ {", ".join(ex["pos_triggers"][:2])}</span> &nbsp;' 
+            if ex["neg_triggers"]:
+                triggers_html += f'<span style="font-size:9px;color:#ef4444">❌ {", ".join(ex["neg_triggers"][:2])}</span>'
+            st.markdown(f'''<div style="background:#0a1220;border-left:3px solid {color};border-radius:0 10px 10px 0;padding:12px 16px;margin-bottom:8px">
+                <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#4a6080;margin-bottom:5px">
+                    📎 {ex["id"]} &nbsp;{seg_badge}&nbsp;
+                    <span style="color:#8a9ab5">{ex["specialty"][:25]}</span>
+                </div>
+                <div style="font-size:13px;color:#c8d4e8;font-style:italic;line-height:1.7">"{h_sent}"</div>
+                <div style="margin-top:6px">{triggers_html}</div>
+            </div>''', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Export ────────────────────────────────────────────────────────────
+    st.markdown('<div class="sec-lbl">⬇ EXPORT SENTIMENT DATA</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:12px">Every sentence · HCP ID · Setting · Specialty · Target · Sentiment · Confidence · Trigger words · Net Sentiment Score per HCP</div>', unsafe_allow_html=True)
+
+    # Build per-HCP NSS summary
+    hcp_rows = {}
+    for r in sa["all_results"]:
+        hid = r["id"]
+        if hid not in hcp_rows:
+            hcp_rows[hid] = {"id":hid,"setting":r["setting"],"specialty":r["specialty"],
+                             "target":r["target"],"pos":0,"neg":0,"mix":0,"neu":0,"total":0}
+        hcp_rows[hid][r["sentiment"].lower()[:3]] = hcp_rows[hid].get(r["sentiment"].lower()[:3],0) + 1
+        hcp_rows[hid]["total"] += 1
+
+    def hcp_nss(h):
+        denom = h["pos"] + h["neg"] + h["neu"]
+        return round((h["pos"] - h["neg"]) / denom * 100, 1) if denom > 0 else 0
+
+    hcp_nss_map = {h["id"]: hcp_nss(h) for h in hcp_rows.values()}
+
+    # Sentence-level export
+    export_rows = []
+    for r in sa["all_results"]:
+        hn = hcp_nss_map.get(r["id"], 0)
+        export_rows.append({
+            "HCP_ID": r["id"],
+            "Practice_Setting": r["setting"],
+            "Specialty": r["specialty"],
+            "Target_Type": r["target"],
+            "Sentence": r["sentence"],
+            "Sentiment": r["sentiment"],
+            "Confidence": r["confidence"],
+            "Positive_Triggers": ", ".join(r["pos_triggers"]),
+            "Negative_Triggers": ", ".join(r["neg_triggers"]),
+            "Themes_in_Sentence": ", ".join(r["sentence_themes"][:5]),
+            "HCP_NSS": f"{hn:+.1f}",
+            "HCP_NSS_Label": "Net positive" if hn > 10 else "Net negative" if hn < -10 else "Balanced",
+        })
+
+    # HCP-level NSS summary
+    hcp_summary_rows = []
+    for h in hcp_rows.values():
+        hn = hcp_nss(h)
+        hcp_summary_rows.append({
+            "HCP_ID": h["id"],
+            "Practice_Setting": h["setting"],
+            "Specialty": h["specialty"],
+            "Target_Type": h["target"],
+            "Total_Sentences": h["total"],
+            "Positive": h["pos"],
+            "Negative": h["neg"],
+            "Mixed": h.get("mix",0),
+            "Neutral": h["neu"],
+            "Net_Sentiment_Score (NSS)": f"{hn:+.1f}",
+            "NSS_Label": "Net positive" if hn > 10 else "Net negative" if hn < -10 else "Balanced",
+        })
+
+    if export_rows:
+        tab_sent, tab_hcp = st.tabs(["📄 All sentences", "👤 HCP-level NSS summary"])
+
+        with tab_sent:
+            dfe = pd.DataFrame(export_rows)
+            preview_cols = ["HCP_ID","Practice_Setting","Specialty","Sentiment","Confidence","HCP_NSS","Sentence"]
+            st.dataframe(dfe[preview_cols].head(25), hide_index=True, use_container_width=True)
+            st.download_button(
+                f"⬇ Download all {len(export_rows)} sentences — {theme} sentiment CSV",
+                dfe.to_csv(index=False).encode(),
+                f"sentiment_sentences_{theme.replace('/','_')}.csv", "text/csv"
+            )
+
+        with tab_hcp:
+            dfs = pd.DataFrame(hcp_summary_rows).sort_values("Net_Sentiment_Score (NSS)", ascending=False)
+            st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:10px">One row per HCP. NSS = (Positive − Negative) ÷ (Pos + Neg + Neutral) × 100. Sorted most positive first.</div>', unsafe_allow_html=True)
+            st.dataframe(dfs, hide_index=True, use_container_width=True)
+            st.download_button(
+                f"⬇ Download HCP-level NSS summary — {theme}",
+                dfs.to_csv(index=False).encode(),
+                f"sentiment_hcp_nss_{theme.replace('/','_')}.csv", "text/csv"
+            )
+
+
+
 def render_dashboard(theme, full_df):
     pats = THEMES.get(theme, [theme.lower()])
     theme_df = full_df[full_df["text_lower"].apply(lambda x: any(p in x for p in pats))]
@@ -554,7 +1065,7 @@ def render_dashboard(theme, full_df):
         st.warning(f"No respondents mentioned {theme} in the uploaded data.")
         return
 
-    tab1, tab2, tab3 = st.tabs(["📋  Dashboard Summary", "💬  Quotes & Evidence", "⬇  Download"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📋  Dashboard Summary", "🎭  Sentiment Analysis", "💬  Quotes & Evidence", "⬇  Download"])
 
     with tab1:
         # Stat row
@@ -612,6 +1123,9 @@ def render_dashboard(theme, full_df):
         st.markdown('</div>', unsafe_allow_html=True)
 
     with tab2:
+        render_sentiment_tab(theme, full_df)
+
+    with tab3:
         all_settings = ["All"] + sorted(theme_df["setting"].dropna().unique().tolist())
         filter_s = st.selectbox("Filter by Setting", all_settings, key=f"ds_{theme}")
         disp = theme_df if filter_s == "All" else theme_df[theme_df["setting"] == filter_s]
@@ -619,7 +1133,7 @@ def render_dashboard(theme, full_df):
         for _, row in disp.iterrows():
             quote_card(row, focus=[theme])
 
-    with tab3:
+    with tab4:
         export_rows = []
         for _, row in theme_df.iterrows():
             others = [t for t,p2 in THEMES.items() if t!=theme and any(p in row["text_lower"] for p in p2)]
