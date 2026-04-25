@@ -227,17 +227,29 @@ def load_excel(file):
 
     # ── Step 6: extract doctor-only speech ────────────────────────────────────
     def doctor_text(t):
-        # SPEAKER_B pattern
-        lines = re.findall(r'SPEAKER_B:\s*(.+?)(?=SPEAKER_A:|SPEAKER_B:|$)', t, re.DOTALL)
+        # SPEAKER_B — strict extraction, HCP responses only
+        lines = re.findall(r'SPEAKER_B:\s*(.+?)(?=SPEAKER_A:|SPEAKER_B:|\Z)', t, re.DOTALL)
         cleaned = [re.sub(r'\s+', ' ', l).strip() for l in lines if len(l.strip()) > 15]
         result = ' '.join(cleaned)
-        if len(result) > 50: return result
-        # Doctor: pattern
-        lines2 = re.findall(r'Doctor:\s*(.+?)(?=AI Moderator:|Doctor:|$)', t, re.DOTALL)
+        if len(result) > 50:
+            return result
+        # Doctor: pattern (some transcripts use this label instead)
+        lines2 = re.findall(r'Doctor:\s*(.+?)(?=AI Moderator:|Doctor:|\Z)', t, re.DOTALL)
         cleaned2 = [re.sub(r'\s+', ' ', l).strip() for l in lines2 if len(l.strip()) > 15]
         result2 = ' '.join(cleaned2)
-        if len(result2) > 50: return result2
-        return t  # fallback: full text
+        if len(result2) > 50:
+            return result2
+        # HCP: pattern
+        lines3 = re.findall(r'HCP:\s*(.+?)(?=Moderator:|HCP:|\Z)', t, re.DOTALL)
+        cleaned3 = [re.sub(r'\s+', ' ', l).strip() for l in lines3 if len(l.strip()) > 15]
+        result3 = ' '.join(cleaned3)
+        if len(result3) > 50:
+            return result3
+        # Last resort: strip ALL Speaker A / moderator lines and keep the rest
+        # Remove SPEAKER_A, AI Moderator, Moderator lines entirely
+        stripped = re.sub(r'(SPEAKER_A|AI Moderator|Moderator):\s*.+?(?=SPEAKER_B:|Doctor:|HCP:|\Z)', '', t, flags=re.DOTALL)
+        stripped = re.sub(r'\s+', ' ', stripped).strip()
+        return stripped if len(stripped) > 30 else t
 
     out["text"]       = out["text"].apply(doctor_text)
     out["text_lower"] = out["text"].str.lower()
@@ -733,8 +745,11 @@ def run_sentiment_analysis(theme, full_df, theme_filter=None):
         for val in vals:
             val_sents = [r for r in theme_sents if r[col] == val]
             vt = len(val_sents)
+            # Count unique respondents (HCP IDs) in this segment
+            n_resp = len(set(r["id"] for r in val_sents))
             seg_sentiment[col][val] = {
-                "total": vt,
+                "total": vt,           # total sentences
+                "n_resp": n_resp,       # unique respondents
                 "pos": sum(1 for r in val_sents if r["sentiment"] == "POSITIVE"),
                 "neg": sum(1 for r in val_sents if r["sentiment"] == "NEGATIVE"),
                 "mixed": sum(1 for r in val_sents if r["sentiment"] == "MIXED"),
@@ -878,61 +893,139 @@ def render_sentiment_tab(theme, full_df):
 
     # ── Segment breakdown ─────────────────────────────────────────────────
     st.markdown('<div class="sec-lbl">SENTIMENT BY SEGMENT</div>', unsafe_allow_html=True)
-    seg_cols = st.columns(3)
-    for col_w, (seg_key, seg_label) in zip(seg_cols, [("setting","Practice Setting"),("specialty","Specialty"),("target","Target Type")]):
-        with col_w:
-            seg_data = sa["seg_sentiment"].get(seg_key, {})
-            if not seg_data:
-                continue
-            st.markdown(f'<div class="card"><div class="sec-lbl">{seg_label}</div>', unsafe_allow_html=True)
-            for val, d in sorted(seg_data.items(), key=lambda x: -(x[1]["pos"]+x[1]["neg"])):
-                vt = d["total"]
-                if vt == 0: continue
-                p = round(d["pos"]/vt*100)
-                n = round(d["neg"]/vt*100)
-                m = round(d["mixed"]/vt*100)
-                seg_nss_denom = d["pos"] + d["neg"] + d.get("neutral", 0)
-                seg_nss = round((d["pos"] - d["neg"]) / seg_nss_denom * 100, 1) if seg_nss_denom > 0 else 0
-                nss_c = "#10b981" if seg_nss > 10 else "#ef4444" if seg_nss < -10 else "#f59e0b"
-                st.markdown(f'''<div style="margin-bottom:12px">
-                    <div style="font-size:11px;color:#e2ecf8;font-weight:500;margin-bottom:4px">{val[:30]}</div>
-                    <div style="display:flex;height:10px;border-radius:3px;overflow:hidden;gap:1px">
-                        <div style="width:{p}%;background:#10b981"></div>
-                        <div style="width:{n}%;background:#ef4444"></div>
-                        <div style="width:{m}%;background:#f59e0b"></div>
-                        <div style="flex:1;background:#1e293b"></div>
-                    </div>
-                    <div style="display:flex;gap:8px;margin-top:3px;font-size:9px;font-family:'IBM Plex Mono',monospace;flex-wrap:wrap">
-                        <span style="color:#10b981">+{p}%</span>
-                        <span style="color:#ef4444">-{n}%</span>
-                        <span style="color:#f59e0b">±{m}%</span>
-                        <span style="color:#4a6080">{vt} sent.</span>
-                        <span style="color:{nss_c};font-weight:700">NSS:{seg_nss:+.0f}</span>
-                    </div>
-                </div>''', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:14px">How sentiment on this theme breaks down across each segment. NSS = Net Sentiment Score — positive means more favourable than negative mentions.</div>', unsafe_allow_html=True)
 
-    # ── Trigger word analysis ─────────────────────────────────────────────
-    lc, rc = st.columns(2)
-    with lc:
-        st.markdown('<div class="card"><div class="sec-lbl" style="color:#10b981">TOP POSITIVE TRIGGER WORDS</div>', unsafe_allow_html=True)
-        st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:10px">Words/phrases that drove positive classification — from actual sentences in uploaded data</div>', unsafe_allow_html=True)
-        for trigger, cnt in sa["top_pos_triggers"].items():
-            st.markdown(f'''<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid #1a2640">
-                <span style="font-size:12px;color:#e2ecf8;font-style:italic">"{trigger}"</span>
-                <span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#10b981">{cnt}x</span>
+    for seg_key, seg_label in [("setting","Practice Setting"),("specialty","Specialty"),("target","Target Type")]:
+        seg_data = sa["seg_sentiment"].get(seg_key, {})
+        if not seg_data: continue
+
+        st.markdown(f'''<div class="card" style="margin-bottom:14px">
+            <div class="sec-lbl" style="margin-bottom:14px">{seg_label}</div>
+            <div style="display:grid;grid-template-columns:160px 1fr 70px 70px 70px 80px 80px 90px;gap:0;font-size:10px;font-weight:600;color:#4a6080;letter-spacing:0.5px;text-transform:uppercase;border-bottom:1px solid #1a2640;padding-bottom:6px;margin-bottom:6px">
+                <span>Segment</span>
+                <span>Sentiment bar</span>
+                <span style="text-align:center">Positive</span>
+                <span style="text-align:center">Negative</span>
+                <span style="text-align:center">Mixed</span>
+                <span style="text-align:center">HCPs</span>
+                <span style="text-align:center">Sentences</span>
+                <span style="text-align:center">NSS</span>
             </div>''', unsafe_allow_html=True)
+
+        for val, d in sorted(seg_data.items(), key=lambda x: -(x[1]["pos"]+x[1]["neg"])):
+            vt = d["total"]
+            if vt == 0: continue
+            pos_n = d["pos"]; neg_n = d["neg"]; mix_n = d.get("mixed",0)
+            n_resp = d.get("n_resp", "—")
+            p = round(pos_n/vt*100); n = round(neg_n/vt*100); m = round(mix_n/vt*100)
+            seg_nss_denom = pos_n + neg_n + d.get("neutral", 0)
+            seg_nss = round((pos_n - neg_n) / seg_nss_denom * 100) if seg_nss_denom > 0 else 0
+            nss_c = "#10b981" if seg_nss > 10 else "#ef4444" if seg_nss < -10 else "#f59e0b"
+            nss_label_s = "Net positive" if seg_nss > 10 else "Net negative" if seg_nss < -10 else "Balanced"
+            pos_str = f"{p}%" if p > 0 else "—"
+            neg_str = f"{n}%" if n > 0 else "—"
+            mix_str = f"{m}%" if m > 0 else "—"
+
+            st.markdown(f'''<div style="display:grid;grid-template-columns:160px 1fr 70px 70px 70px 80px 80px 90px;gap:0;align-items:center;padding:8px 0;border-bottom:1px solid #0f1823">
+                <div style="font-size:12px;color:#e2ecf8;font-weight:500;padding-right:8px">{val[:22]}</div>
+                <div style="display:flex;height:12px;border-radius:3px;overflow:hidden;gap:2px;margin-right:8px">
+                    <div style="width:{p}%;background:#10b981;border-radius:2px 0 0 2px"></div>
+                    <div style="width:{n}%;background:#ef4444"></div>
+                    <div style="width:{m}%;background:#f59e0b"></div>
+                    <div style="flex:1;background:#1e293b;border-radius:0 2px 2px 0"></div>
+                </div>
+                <div style="text-align:center;font-size:12px;color:#10b981;font-weight:500">{pos_str}</div>
+                <div style="text-align:center;font-size:12px;color:{"#ef4444" if n > 0 else "#4a6080"};font-weight:500">{neg_str}</div>
+                <div style="text-align:center;font-size:12px;color:{"#f59e0b" if m > 0 else "#4a6080"}">{mix_str}</div>
+                <div style="text-align:center">
+                    <div style="font-size:13px;color:#e2ecf8;font-weight:500">{n_resp}</div>
+                    <div style="font-size:9px;color:#4a6080;margin-top:1px">HCPs</div>
+                </div>
+                <div style="text-align:center">
+                    <div style="font-size:13px;color:#64748b">{vt}</div>
+                    <div style="font-size:9px;color:#4a6080;margin-top:1px">sentences</div>
+                </div>
+                <div style="text-align:center">
+                    <span style="font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:700;color:{nss_c}">{seg_nss:+d}</span>
+                    <div style="font-size:9px;color:{nss_c};margin-top:1px">{nss_label_s}</div>
+                </div>
+            </div>''', unsafe_allow_html=True)
+
+        # ── Calculation workings ──────────────────────────────────────────
+        st.markdown('<div style="margin-top:14px;border-top:1px solid #1a2640;padding-top:12px">', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:10px;font-weight:600;color:#4a6080;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px">NSS calculation workings</div>', unsafe_allow_html=True)
+
+        # Header row
+        st.markdown('''<div style="display:grid;grid-template-columns:160px 50px 50px 50px 50px 1fr 90px;gap:4px;font-size:9px;font-weight:600;color:#4a6080;letter-spacing:0.5px;text-transform:uppercase;padding:4px 8px;background:#0a1220;border-radius:6px 6px 0 0">
+            <span>Segment</span>
+            <span style="text-align:center">Pos</span>
+            <span style="text-align:center">Neg</span>
+            <span style="text-align:center">Neutral</span>
+            <span style="text-align:center">Total</span>
+            <span style="text-align:center">Formula: (Pos − Neg) ÷ Total × 100</span>
+            <span style="text-align:center">NSS</span>
+        </div>''', unsafe_allow_html=True)
+
+        for val, d in sorted(seg_data.items(), key=lambda x: -(x[1]["pos"]+x[1]["neg"])):
+            vt2 = d["total"]
+            if vt2 == 0: continue
+            pos2 = d["pos"]; neg2 = d["neg"]; neu2 = d.get("neutral", 0)
+            denom2 = pos2 + neg2 + neu2
+            nss2 = round((pos2 - neg2) / denom2 * 100) if denom2 > 0 else 0
+            nss2_c = "#10b981" if nss2 > 10 else "#ef4444" if nss2 < -10 else "#f59e0b"
+            formula_str = f"({pos2} − {neg2}) ÷ ({pos2} + {neg2} + {neu2}) × 100 = ({pos2 - neg2}) ÷ {denom2} × 100"
+            # Sample size warning
+            n_resp2 = d.get("n_resp", 0)
+            warn = " ⚠" if (n_resp2 < 5 or vt2 < 10) else ""
+            st.markdown(f'''<div style="display:grid;grid-template-columns:160px 50px 50px 50px 50px 1fr 90px;gap:4px;font-size:11px;align-items:center;padding:5px 8px;border-bottom:1px solid #0f1823;background:#0d1420">
+                <span style="color:#c8d4e8;font-weight:500">{val[:22]}{warn}</span>
+                <span style="text-align:center;color:#10b981;font-family:'IBM Plex Mono',monospace">{pos2}</span>
+                <span style="text-align:center;color:{"#ef4444" if neg2 > 0 else "#4a6080"};font-family:'IBM Plex Mono',monospace">{neg2}</span>
+                <span style="text-align:center;color:#4a6080;font-family:'IBM Plex Mono',monospace">{neu2}</span>
+                <span style="text-align:center;color:#64748b;font-family:'IBM Plex Mono',monospace">{denom2}</span>
+                <span style="color:#64748b;font-size:10px;font-family:'IBM Plex Mono',monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{formula_str}</span>
+                <span style="text-align:center;font-family:'IBM Plex Mono',monospace;font-weight:700;color:{nss2_c}">{nss2:+d}</span>
+            </div>''', unsafe_allow_html=True)
+
+        # Warning note if any small samples
+        small_segs = [val for val, d in seg_data.items() if d.get("n_resp",0) < 5 or d.get("total",0) < 10]
+        if small_segs:
+            st.markdown(f'<div style="font-size:10px;color:#f59e0b;padding:6px 8px;background:#1a1200;border-radius:0 0 6px 6px">⚠ Small sample: {", ".join(small_segs[:3])} — treat NSS directionally, not conclusively (n &lt; 5 HCPs or &lt; 10 sentences)</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="height:4px;background:#0a1220;border-radius:0 0 6px 6px"></div>', unsafe_allow_html=True)
+
+        st.markdown('</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    with rc:
-        st.markdown('<div class="card"><div class="sec-lbl" style="color:#ef4444">TOP NEGATIVE TRIGGER WORDS</div>', unsafe_allow_html=True)
-        st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:10px">Words/phrases that drove negative classification — from actual sentences in uploaded data</div>', unsafe_allow_html=True)
-        for trigger, cnt in sa["top_neg_triggers"].items():
-            st.markdown(f'''<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid #1a2640">
-                <span style="font-size:12px;color:#e2ecf8;font-style:italic">"{trigger}"</span>
-                <span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#ef4444">{cnt}x</span>
-            </div>''', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+    # ── NSS methodology note ──────────────────────────────────────────────
+    st.markdown(f'''<div class="card" style="border-left:3px solid #3b6ef7">
+        <div class="sec-lbl">HOW THE NET SENTIMENT SCORE (NSS) WAS CALCULATED</div>
+        <div style="font-size:13px;color:#c8d4e8;line-height:1.85">
+            Each SPEAKER_B response was split into individual sentences. Only sentences referencing
+            <b style="color:#e2ecf8">{theme}</b> were included. Each sentence was independently classified as
+            <b style="color:#10b981">Positive</b>, <b style="color:#ef4444">Negative</b>,
+            <b style="color:#f59e0b">Mixed</b>, or <b style="color:#64748b">Neutral</b>
+            using a pharma-tuned lexicon of 60+ positive and 65+ negative signals,
+            with negation detection (e.g. "no concern" → positive) and context overrides
+            (e.g. "delay radiation" → positive).
+        </div>
+        <div style="margin-top:12px;background:#0a1220;border-radius:8px;padding:12px 16px">
+            <div style="font-size:12px;color:#4a6080;margin-bottom:6px">Formula applied:</div>
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#e2ecf8">
+                NSS = (Positive sentences − Negative sentences) ÷ Total sentences × 100
+            </div>
+            <div style="font-size:11px;color:#4a6080;margin-top:6px">
+                Where Total = Positive + Negative + Neutral &nbsp;|&nbsp;
+                Mixed sentences excluded from denominator to avoid double-counting &nbsp;|&nbsp;
+                Score ranges from −100 (entirely negative) to +100 (entirely positive)
+            </div>
+        </div>
+        <div style="margin-top:10px;display:flex;gap:20px;font-size:12px">
+            <span><b style="color:#10b981">▲ &gt; +10</b> = Net positive sentiment</span>
+            <span><b style="color:#f59e0b">● −10 to +10</b> = Balanced sentiment</span>
+            <span><b style="color:#ef4444">▼ &lt; −10</b> = Net negative sentiment</span>
+        </div>
+    </div>''', unsafe_allow_html=True)
 
     # ── Verbatim evidence by sentiment ────────────────────────────────────
     for sent_type, examples, color, icon, label in [
