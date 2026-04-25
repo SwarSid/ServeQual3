@@ -475,6 +475,171 @@ def answer(q, adf, fdf):
         res["chart"]={"Themes Found":dict(sorted({t:v for t,v in t_counts(mdf).items() if v>0}.items(),key=lambda x:-x[1])[:10])}
     return res
 
+
+# ── DASHBOARD ENGINE ──────────────────────────────────────────────────────────
+
+def build_segment_breakdown(theme, full_df):
+    pats = THEMES.get(theme, [theme.lower()])
+    result = {}
+    for col in ["setting", "specialty", "target"]:
+        breakdown = {}
+        for val in full_df[col].dropna().unique():
+            seg = full_df[full_df[col] == val]
+            n_seg = len(seg)
+            n_match = int(seg["text_lower"].apply(lambda x: any(p in x for p in pats)).sum())
+            if n_seg > 0:
+                breakdown[val] = {"n": n_match, "total": n_seg, "pct": round(n_match / n_seg * 100)}
+        result[col] = breakdown
+    return result
+
+
+def build_exec_summary(theme, theme_df, full_df, seg_data):
+    T = len(full_df); n = len(theme_df); pct = round(n/T*100) if T else 0
+    points = []
+    # 1 — Prevalence
+    freq = "one of the most prominent" if pct >= 50 else "a notable" if pct >= 30 else "a less frequently cited"
+    points.append(f"**{n} of {T} respondents ({pct}%)** mentioned **{theme}**, making it {freq} topic in the uploaded dataset.")
+    # 2 — Setting split
+    s = seg_data.get("setting", {})
+    if len(s) >= 2:
+        items = sorted(s.items(), key=lambda x: -x[1]["pct"])
+        top, bot = items[0], items[-1]
+        gap = top[1]["pct"] - bot[1]["pct"]
+        if gap >= 10:
+            points.append(f"**{top[0]}** HCPs discuss {theme} more than **{bot[0]}** ({top[1]['pct']}% vs {bot[1]['pct']}%) — a **{gap}pp gap** suggesting practice setting shapes how this topic surfaces.")
+        else:
+            points.append(f"Mentions are broadly consistent across settings — **{top[0]}**: {top[1]['pct']}% vs **{bot[0]}**: {bot[1]['pct']}% — no major setting-driven divide.")
+    # 3 — Specialty split
+    sp = seg_data.get("specialty", {})
+    if len(sp) >= 2:
+        items = sorted(sp.items(), key=lambda x: -x[1]["pct"])
+        top_sp = items[0]
+        others_str = "; ".join(f"{v}: {d['pct']}%" for v,d in items[1:])
+        points.append(f"By specialty, **{top_sp[0]}** most frequently discusses {theme} ({top_sp[1]['pct']}% of that group). Other specialties: {others_str}.")
+    # 4 — Co-theme
+    co = {}
+    for t, p2 in THEMES.items():
+        if t == theme: continue
+        c = int(theme_df["text_lower"].apply(lambda x: any(p in x for p in p2)).sum())
+        if c: co[t] = c
+    if co:
+        top3 = sorted(co.items(), key=lambda x: -x[1])[:3]
+        co_str = ", ".join(f"**{t}** ({c} respondents)" for t,c in top3)
+        points.append(f"{theme} most frequently co-occurs with {co_str} — suggesting it is rarely discussed in isolation and is part of a broader clinical narrative.")
+    # 5 — Treatment impact / complexity
+    solo = sum(1 for _,row in theme_df.iterrows() if sum(1 for t,p2 in THEMES.items() if t!=theme and any(p in row["text_lower"] for p in p2)) <= 1)
+    comp = sum(1 for _,row in theme_df.iterrows() if sum(1 for t,p2 in THEMES.items() if t!=theme and any(p in row["text_lower"] for p in p2)) >= 4)
+    if solo > comp:
+        points.append(f"**{theme} acts as a standalone treatment driver** — {solo} of {n} respondents ({round(solo/n*100)}%) cited it without many other themes, indicating it directly and independently influences prescribing decisions.")
+    elif comp > solo:
+        points.append(f"**{theme} is a complex, multi-factor driver** — {comp} of {n} respondents ({round(comp/n*100)}%) discussed it alongside 4+ other themes, suggesting it is embedded in a broader decision-making process rather than a single decisive factor.")
+    else:
+        points.append(f"**{theme} shows mixed complexity** — cited as a direct standalone reason by {solo} respondents and as part of multi-theme discussions by {comp} others, indicating context-dependent importance.")
+    return points
+
+
+def render_dashboard(theme, full_df):
+    pats = THEMES.get(theme, [theme.lower()])
+    theme_df = full_df[full_df["text_lower"].apply(lambda x: any(p in x for p in pats))]
+    T = len(full_df); n = len(theme_df); color = TC.get(theme, "#3b6ef7")
+    seg_data = build_segment_breakdown(theme, full_df)
+
+    st.markdown(f"""<div style="background:#0d1420;border:1px solid #1a2640;border-radius:14px;padding:20px 24px;margin-bottom:20px;border-left:4px solid {color}">
+        <div style="font-size:10px;letter-spacing:2px;text-transform:uppercase;color:{color};font-weight:600;margin-bottom:6px;font-family:'IBM Plex Mono',monospace">THEME DASHBOARD</div>
+        <div style="font-size:26px;font-weight:700;color:#e2ecf8;margin-bottom:4px">{theme}</div>
+        <div style="font-size:13px;color:#4a6080">Based on {T} uploaded respondents · All data from your Excel · No inference</div>
+    </div>""", unsafe_allow_html=True)
+
+    if n == 0:
+        st.warning(f"No respondents mentioned {theme} in the uploaded data.")
+        return
+
+    tab1, tab2, tab3 = st.tabs(["📋  Dashboard Summary", "💬  Quotes & Evidence", "⬇  Download"])
+
+    with tab1:
+        # Stat row
+        co = {}
+        for t, p2 in THEMES.items():
+            if t == theme: continue
+            c = int(theme_df["text_lower"].apply(lambda x: any(p in x for p in p2)).sum())
+            if c: co[t] = c
+        top_co = max(co, key=co.get) if co else "—"
+        solo = sum(1 for _,row in theme_df.iterrows() if sum(1 for t,p2 in THEMES.items() if t!=theme and any(p in row["text_lower"] for p in p2)) <= 1)
+        verdict = "Standalone" if solo > n//2 else "Complex"
+        vc = "#10b981" if verdict == "Standalone" else "#ef4444"
+
+        c1,c2,c3,c4 = st.columns(4)
+        c1.markdown(f'<div class="card" style="text-align:center;border-left:3px solid {color}"><div class="stat-num" style="color:{color}">{n}</div><div class="stat-lbl">respondents</div></div>', unsafe_allow_html=True)
+        c2.markdown(f'<div class="card" style="text-align:center"><div class="stat-num">{round(n/T*100)}%</div><div class="stat-lbl">of total sample</div></div>', unsafe_allow_html=True)
+        c3.markdown(f'<div class="card" style="text-align:center"><div class="stat-num" style="font-size:16px;line-height:1.4">{top_co}</div><div class="stat-lbl">top co-theme</div></div>', unsafe_allow_html=True)
+        c4.markdown(f'<div class="card" style="text-align:center"><div class="stat-num" style="color:{vc};font-size:20px">{verdict}</div><div class="stat-lbl">driver type</div></div>', unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Executive summary
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown(f'<div class="sec-lbl">5-POINT EXECUTIVE SUMMARY</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:16px">Synthesised from uploaded data only. Every point is backed by counts from your Excel.</div>', unsafe_allow_html=True)
+        for i, pt in enumerate(build_exec_summary(theme, theme_df, full_df, seg_data), 1):
+            st.markdown(f"""<div style="display:flex;gap:14px;margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid #1a2640;align-items:flex-start">
+                <div style="font-family:'IBM Plex Mono',monospace;font-size:18px;color:{color};font-weight:700;min-width:28px;line-height:1.4">{i}</div>
+                <div style="font-size:14px;color:#c8d4e8;line-height:1.75">{pt}</div>
+            </div>""", unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # Segment breakdowns
+        seg_cols_ui = st.columns(3)
+        for col_w, (seg_col, label) in zip(seg_cols_ui, [("setting","BY PRACTICE SETTING"),("specialty","BY SPECIALTY"),("target","BY TARGET TYPE")]):
+            bd = seg_data.get(seg_col, {})
+            if not bd: continue
+            with col_w:
+                st.markdown(f'<div class="card"><div class="sec-lbl">{label}</div>', unsafe_allow_html=True)
+                for val, dp in sorted(bd.items(), key=lambda x: -x[1]["pct"]):
+                    st.markdown(f"""<div style="margin-bottom:10px">
+                        <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px">
+                            <span style="color:#e2ecf8;font-weight:500">{val}</span>
+                            <span style="font-family:'IBM Plex Mono',monospace;color:{color}">{dp["n"]}/{dp["total"]} ({dp["pct"]}%)</span>
+                        </div>
+                        <div class="bar-trk"><div class="bar-fill" style="width:{dp["pct"]}%;background:{color}"></div></div>
+                    </div>""", unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+        # Co-theme chart
+        st.markdown(f'<div class="card"><div class="sec-lbl">MOST ASSOCIATED THEMES</div>', unsafe_allow_html=True)
+        st.markdown(f'<div style="font-size:11px;color:#4a6080;margin-bottom:12px">Among {n} respondents who mentioned {theme}, these other themes also appeared.</div>', unsafe_allow_html=True)
+        for t_co, cnt_co in sorted(co.items(), key=lambda x: -x[1])[:10]:
+            if cnt_co: bar_html(t_co, cnt_co, n, TC.get(t_co, "#4a6080"))
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with tab2:
+        all_settings = ["All"] + sorted(theme_df["setting"].dropna().unique().tolist())
+        filter_s = st.selectbox("Filter by Setting", all_settings, key=f"ds_{theme}")
+        disp = theme_df if filter_s == "All" else theme_df[theme_df["setting"] == filter_s]
+        st.markdown(f'<div style="font-size:11px;color:#4a6080;margin-bottom:12px">Showing {len(disp)} respondents. Full verbatim text, all themes colour-highlighted.</div>', unsafe_allow_html=True)
+        for _, row in disp.iterrows():
+            quote_card(row, focus_themes=[theme])
+
+    with tab3:
+        export_rows = []
+        for _, row in theme_df.iterrows():
+            others = [t for t,p2 in THEMES.items() if t!=theme and any(p in row["text_lower"] for p in p2)]
+            export_rows.append({"ID":row["id"],"Setting":row["setting"],"Specialty":row["specialty"],"Target":row.get("target",""),
+                                 f"Mentioned {theme}":"Yes","Other Themes":", ".join(others[:8]),
+                                 "N Other Themes":len(others),"Driver Type":"Standalone" if len(others)<=1 else "Complex" if len(others)>=4 else "Moderate",
+                                 "Full Response":row["text"]})
+        dfe = pd.DataFrame(export_rows)
+        preview_cols = [c for c in ["ID","Setting","Specialty","Target","Driver Type","N Other Themes"] if c in dfe.columns]
+        st.dataframe(dfe[preview_cols], hide_index=True, use_container_width=True)
+        c1,c2 = st.columns(2)
+        with c1:
+            st.download_button(f"⬇ {theme} full responses CSV", dfe.to_csv(index=False).encode(), f"{theme.replace('/','_')}_responses.csv", "text/csv")
+        with c2:
+            sum_rows = [{"Segment Type":lbl,"Segment Value":val,"N Mentioned":dp["n"],"Total in Group":dp["total"],"% Mentioned":f"{dp['pct']}%"}
+                        for seg_col,lbl in [("setting","Setting"),("specialty","Specialty"),("target","Target")]
+                        for val,dp in seg_data.get(seg_col,{}).items()]
+            st.download_button(f"⬇ {theme} segment summary CSV", pd.DataFrame(sum_rows).to_csv(index=False).encode(), f"{theme.replace('/','_')}_segments.csv", "text/csv")
+
+
 # ── QUESTION BANK ─────────────────────────────────────────────────────────────
 QB = {
     "📊 Frequency": ["How many HCPs mentioned PFS?","How many discussed cost or insurance?","How often was quality of life mentioned?","How many cited the Indigo trial?","What percentage mentioned seizures?","How many brought up radiation delay?","How many discussed oral administration?","How many mentioned NCCN guidelines?","How many raised fertility concerns?","How often was performance status cited?"],
@@ -531,17 +696,40 @@ with st.sidebar:
     st.markdown(f'<div class="card" style="text-align:center;margin-top:6px"><div class="stat-num">{fn}</div><div class="stat-lbl">in view</div><div style="font-size:11px;margin-top:6px">{sh}</div></div>', unsafe_allow_html=True)
     st.markdown("<hr>", unsafe_allow_html=True)
 
-    st.markdown('<div class="sec-lbl">QUESTION BROWSER</div>', unsafe_allow_html=True)
-    st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:8px">Click any question to run instantly</div>', unsafe_allow_html=True)
-    for cat, qs in QB.items():
-        with st.expander(cat, expanded=False):
-            for q in qs:
-                if st.button(q, key=f"qb_{q[:28]}"):
-                    st.session_state["q"] = q
-                    st.rerun()
+    # ── TWO-TAB SIDEBAR ──────────────────────────────────────────────────────
+    side_tab1, side_tab2 = st.tabs(["📊  Dashboard", "❓  Questions"])
+
+    with side_tab1:
+        st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:10px;line-height:1.6;margin-top:8px">Click any theme for a full dashboard — executive summary, segment breakdown, quotes and downloads.</div>', unsafe_allow_html=True)
+        for theme_name in list(THEMES.keys()):
+            color = TC.get(theme_name, "#3b6ef7")
+            if st.button(f"● {theme_name}", key=f"dash_{theme_name}"):
+                st.session_state["dashboard_theme"] = theme_name
+                st.session_state["q"] = ""
+                st.rerun()
+
+    with side_tab2:
+        st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:8px;margin-top:8px">Click any question to run instantly</div>', unsafe_allow_html=True)
+        for cat, qs in QB.items():
+            with st.expander(cat, expanded=False):
+                for q in qs:
+                    if st.button(q, key=f"qb_{q[:28]}"):
+                        st.session_state["q"] = q
+                        st.session_state["dashboard_theme"] = ""
+                        st.rerun()
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if "q" not in st.session_state: st.session_state["q"] = ""
+if "dashboard_theme" not in st.session_state: st.session_state["dashboard_theme"] = ""
+
+# ── DASHBOARD MODE ────────────────────────────────────────────────────────────
+if st.session_state.get("dashboard_theme") and not st.session_state.get("q"):
+    theme_selected = st.session_state["dashboard_theme"]
+    if st.button("← Back to search", key="back_btn"):
+        st.session_state["dashboard_theme"] = ""
+        st.rerun()
+    render_dashboard(theme_selected, full_df)
+    st.stop()
 
 # Search label + colour legend row
 st.markdown("""
