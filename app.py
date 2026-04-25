@@ -891,6 +891,9 @@ def render_sentiment_tab(theme, full_df):
                 p = round(d["pos"]/vt*100)
                 n = round(d["neg"]/vt*100)
                 m = round(d["mixed"]/vt*100)
+                seg_nss_denom = d["pos"] + d["neg"] + d.get("neutral", 0)
+                seg_nss = round((d["pos"] - d["neg"]) / seg_nss_denom * 100, 1) if seg_nss_denom > 0 else 0
+                nss_c = "#10b981" if seg_nss > 10 else "#ef4444" if seg_nss < -10 else "#f59e0b"
                 st.markdown(f'''<div style="margin-bottom:12px">
                     <div style="font-size:11px;color:#e2ecf8;font-weight:500;margin-bottom:4px">{val[:30]}</div>
                     <div style="display:flex;height:10px;border-radius:3px;overflow:hidden;gap:1px">
