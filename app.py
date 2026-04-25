@@ -228,9 +228,14 @@ def load_excel(file):
     # ── Step 6: extract doctor-only speech ────────────────────────────────────
     def doctor_text(t):
         """
-        Auto-detect which speaker is the doctor vs the AI moderator.
-        Moderators use greeting/question phrases; doctors give clinical answers.
-        Handles both SPEAKER_A=moderator and SPEAKER_B=moderator cases.
+        Extract ONLY doctor/HCP speech from AI-moderated transcripts.
+        Steps:
+          1. Detect which speaker label (A or B) is the moderator vs doctor
+             by scoring against moderator phrase patterns.
+          2. Extract doctor chunks only.
+          3. Filter out any chunk that is purely a question (ends in ?)
+             or is a known moderator-leak pattern (repeating the question back).
+          4. Clean and join.
         """
         MOD_PHRASES = [
             'thank you', 'could you', 'when you', 'what specific', 'how do you',
@@ -241,49 +246,75 @@ def load_excel(file):
             'what are the primary', 'what factors', 'how does', 'how would you',
             'in your experience', 'to confirm', 'so to confirm', 'you mentioned',
             'i did not quite catch', 'please clarify', 'tell me more',
+            'how do i talk', 'how do you navigate', 'how do you handle',
         ]
 
-        # Extract SPEAKER_A and SPEAKER_B chunks
+        # Patterns that indicate a chunk is the moderator question being echoed back
+        MOD_ECHO_PATTERNS = [
+            r'^so when \w+ or \w+ becomes a',
+            r'^when \w+ or \w+ coverage becomes',
+            r'^how do (i|you) (talk|navigate|handle|address)',
+            r'^is that your question',
+            r'^can (you|we) (repeat|go to|move)',
+            r'^(repeat|can you repeat)',
+            r'^(hello|hi|bye|goodbye)[\.\?]?$',
+            r'^yes[\.\?]?$',
+            r'^no[\.\?]?$',
+            r'^(okay|ok|alright|sure)[\.\,]?$',
+        ]
+
+        def clean_chunk(chunk):
+            """Return cleaned chunk or None if it should be excluded."""
+            c = re.sub(r'\s+', ' ', chunk).strip()
+            if len(c) < 15:
+                return None
+            cl = c.lower()
+            # Exclude pure questions (moderator asking) — BUT keep answers that
+            # start with context and end in ? (e.g. 'IDH mutation. Yes?')
+            # Rule: if >60% of sentences end in ?, exclude the chunk
+            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', c) if s.strip()]
+            q_count = sum(1 for s in sentences if s.endswith('?'))
+            if sentences and q_count / len(sentences) > 0.6:
+                return None
+            # Exclude moderator echo patterns
+            for pat in MOD_ECHO_PATTERNS:
+                if re.match(pat, cl):
+                    return None
+            # Exclude very short filler responses
+            filler = ['you.','me.','yes.','no.','okay.','ok.','sure.','hello.','bye.','goodbye.','repeat the question','repeat your question','can you repeat','i cannot hear','i could not hear']
+            if any(cl.startswith(f) or cl == f.rstrip('.') for f in filler):
+                return None
+            return c
+
+        # ── Extract speaker chunks ────────────────────────────────────────
         b_chunks = re.findall(r'SPEAKER_B:\s*(.+?)(?=SPEAKER_A:|SPEAKER_B:|\Z)', t, re.DOTALL)
         a_chunks = re.findall(r'SPEAKER_A:\s*(.+?)(?=SPEAKER_A:|SPEAKER_B:|\Z)', t, re.DOTALL)
 
-        b_text = ' '.join(b_chunks).lower()
-        a_text = ' '.join(a_chunks).lower()
+        if a_chunks or b_chunks:
+            b_text = ' '.join(b_chunks).lower()
+            a_text = ' '.join(a_chunks).lower()
+            b_mod_score = sum(1 for p in MOD_PHRASES if p in b_text)
+            a_mod_score = sum(1 for p in MOD_PHRASES if p in a_text)
 
-        # Score each speaker — higher = more likely to be moderator
-        b_mod_score = sum(1 for p in MOD_PHRASES if p in b_text)
-        a_mod_score = sum(1 for p in MOD_PHRASES if p in a_text)
-
-        # Doctor is the speaker with LOWER moderator score
-        if a_chunks and b_chunks:
-            if b_mod_score > a_mod_score:
-                # SPEAKER_B is moderator → SPEAKER_A is doctor
-                doctor_chunks = a_chunks
-            else:
-                # SPEAKER_A is moderator → SPEAKER_B is doctor (most common)
-                doctor_chunks = b_chunks
-            cleaned = [re.sub(r'\s+', ' ', l).strip() for l in doctor_chunks if len(l.strip()) > 15]
-            result = ' '.join(cleaned)
-            if len(result) > 30:
-                return result
-        elif b_chunks:
-            cleaned = [re.sub(r'\s+', ' ', l).strip() for l in b_chunks if len(l.strip()) > 15]
+            doctor_chunks = a_chunks if b_mod_score > a_mod_score else b_chunks
+            cleaned = [clean_chunk(c) for c in doctor_chunks]
+            cleaned = [c for c in cleaned if c]
             result = ' '.join(cleaned)
             if len(result) > 30:
                 return result
 
-        # Doctor: / HCP: label patterns
-        for pattern, stop in [
-            (r'Doctor:\s*(.+?)(?=AI Moderator:|Doctor:|\Z)', None),
-            (r'HCP:\s*(.+?)(?=Moderator:|HCP:|\Z)', None),
+        # Doctor: / HCP: label patterns (alternative transcript formats)
+        for pattern in [
+            r'Doctor:\s*(.+?)(?=AI Moderator:|Doctor:|\Z)',
+            r'HCP:\s*(.+?)(?=Moderator:|HCP:|\Z)',
         ]:
             lines = re.findall(pattern, t, re.DOTALL)
-            cleaned = [re.sub(r'\s+', ' ', l).strip() for l in lines if len(l.strip()) > 15]
+            cleaned = [clean_chunk(l) for l in lines]
+            cleaned = [c for c in cleaned if c]
             result = ' '.join(cleaned)
             if len(result) > 30:
                 return result
 
-        # Absolute last resort: return as-is (better than empty)
         return re.sub(r'\s+', ' ', t).strip()
 
     out["text"]       = out["text"].apply(doctor_text)
@@ -638,10 +669,15 @@ SENT_NEGATIVE = [
 
 # Negation prefixes — flip negative to positive when present before trigger
 NEGATION_PREFIXES = [
-    "no ", "not ", "never ", "without ", "don't have ", "do not have ",
-    "doesn't have ", "does not have ", "no significant ", "no major ",
-    "haven't seen ", "have not seen ", "eliminates ", "removes ", "resolves ",
-    "no longer ", "absence of ", "free of ", "free from ",
+    "no ", "not ", "never ", "without ",
+    "don't have ", "do not have ", "doesn't have ", "does not have ",
+    "haven't had any ", "haven't had ", "have not had ", "hadn't had ",
+    "haven't seen ", "have not seen ", "haven't experienced ", "have not experienced ",
+    "i haven't ", "i have not ", "we haven't ", "we have not ",
+    "hasn't been ", "has not been ", "wasn't ", "was not ",
+    "no significant ", "no major ", "no real ", "no actual ",
+    "eliminates ", "removes ", "resolves ", "no longer ",
+    "absence of ", "free of ", "free from ",
 ]
 
 # Context words that make negative words POSITIVE (e.g. "delay radiation" = good)
@@ -678,7 +714,7 @@ def classify_sentence_sentiment(sentence):
         if sig in sl:
             # Check if a negation prefix appears before this signal
             sig_idx = sl.find(sig)
-            prefix_window = sl[max(0, sig_idx-25):sig_idx]
+            prefix_window = sl[max(0, sig_idx-50):sig_idx]
             negated = any(neg in prefix_window for neg in NEGATION_PREFIXES)
             if negated:
                 # Negated negative = positive signal
@@ -1180,6 +1216,523 @@ def render_sentiment_tab(theme, full_df):
 
 
 
+
+def render_overall_sentiment(full_df):
+    """
+    Overall sentiment dashboard — all 18 themes, NSS by segment.
+    No quotes shown. Stats only. Download as Excel.
+    """
+    import io
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    st.markdown('''<div style="background:#0d1420;border:1px solid #1a2640;border-radius:14px;padding:18px 22px;margin-bottom:20px;border-left:4px solid #8b5cf6">
+        <div style="font-size:10px;letter-spacing:2px;text-transform:uppercase;color:#8b5cf6;font-weight:600;margin-bottom:6px;font-family:'IBM Plex Mono',monospace">SENTIMENT OVERVIEW</div>
+        <div style="font-size:22px;font-weight:700;color:#e2ecf8;margin-bottom:4px">All Themes — Net Sentiment Scores</div>
+        <div style="font-size:12px;color:#4a6080">NSS = (Positive − Negative) ÷ Total sentences × 100 · All 18 themes · Segmented by Setting, Specialty, Target</div>
+    </div>''', unsafe_allow_html=True)
+
+    with st.spinner("Running sentiment analysis across all 18 themes..."):
+        all_theme_results = {}
+        for theme in THEMES:
+            sa = run_sentiment_analysis(theme, full_df)
+            if sa["total_sentences"] > 0:
+                all_theme_results[theme] = sa
+
+    if not all_theme_results:
+        st.warning("No sentiment data found.")
+        return
+
+    T = len(full_df)
+
+    # ── Overall NSS per theme ─────────────────────────────────────────────
+    st.markdown('<div class="sec-lbl">NET SENTIMENT SCORE — ALL THEMES</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:14px">Ranked by NSS. Green = net positive · Red = net negative · Amber = balanced. Click a theme in the sidebar to see full detail.</div>', unsafe_allow_html=True)
+
+    # Sort by NSS descending
+    theme_nss = []
+    for theme, sa in all_theme_results.items():
+        c = sa["counts"]
+        denom = c["POSITIVE"] + c["NEGATIVE"] + c["NEUTRAL"]
+        nss = round((c["POSITIVE"] - c["NEGATIVE"]) / denom * 100) if denom > 0 else 0
+        theme_nss.append((theme, nss, c["POSITIVE"], c["NEGATIVE"], c["NEUTRAL"], c["MIXED"], sa["total_sentences"], sa["n_respondents"]))
+    theme_nss.sort(key=lambda x: -x[1])
+
+    st.markdown('''<div style="background:#0d1420;border:1px solid #1a2640;border-radius:10px;overflow:hidden;margin-bottom:20px">
+        <div style="display:grid;grid-template-columns:180px 1fr 60px 60px 60px 70px 70px 90px;font-size:10px;font-weight:600;color:#4a6080;letter-spacing:0.5px;text-transform:uppercase;padding:8px 14px;background:#0a1220;border-bottom:1px solid #1a2640">
+            <span>Theme</span><span>NSS bar</span>
+            <span style="text-align:center">HCPs</span>
+            <span style="text-align:center">Pos</span>
+            <span style="text-align:center">Neg</span>
+            <span style="text-align:center">Neutral</span>
+            <span style="text-align:center">Sentences</span>
+            <span style="text-align:center">NSS</span>
+        </div>''', unsafe_allow_html=True)
+
+    for theme, nss, pos, neg, neu, mix, total_s, n_resp in theme_nss:
+        color = TC.get(theme, "#4a6080")
+        nss_c = "#10b981" if nss > 10 else "#ef4444" if nss < -10 else "#f59e0b"
+        nss_label = "Net +" if nss > 10 else "Net −" if nss < -10 else "Balanced"
+        bar_w = min(abs(nss), 100)
+        bar_color = nss_c
+        st.markdown(f'''<div style="display:grid;grid-template-columns:180px 1fr 60px 60px 60px 70px 70px 90px;align-items:center;padding:7px 14px;border-bottom:1px solid #0f1823">
+            <div style="font-size:12px;color:#e2ecf8;font-weight:500">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:{color};margin-right:6px"></span>{theme}
+            </div>
+            <div style="display:flex;height:10px;border-radius:3px;overflow:hidden;margin-right:8px;background:#1e293b">
+                <div style="width:{bar_w}%;background:{bar_color};border-radius:3px"></div>
+            </div>
+            <div style="text-align:center;font-size:12px;color:#e2ecf8;font-weight:500">{n_resp}</div>
+            <div style="text-align:center;font-size:12px;color:#10b981">{pos}</div>
+            <div style="text-align:center;font-size:12px;color:{"#ef4444" if neg > 0 else "#4a6080"}">{neg if neg > 0 else "—"}</div>
+            <div style="text-align:center;font-size:12px;color:#4a6080">{neu}</div>
+            <div style="text-align:center;font-size:12px;color:#64748b">{total_s}</div>
+            <div style="text-align:center">
+                <span style="font-family:'IBM Plex Mono',monospace;font-size:14px;font-weight:700;color:{nss_c}">{nss:+d}</span>
+                <div style="font-size:9px;color:{nss_c}">{nss_label}</div>
+            </div>
+        </div>''', unsafe_allow_html=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── NSS by segment across all themes ─────────────────────────────────
+    st.markdown('<div class="sec-lbl" style="margin-top:20px">NSS BY SEGMENT — ALL THEMES</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:14px">How sentiment compares across segments for every theme. No quotes — stats only.</div>', unsafe_allow_html=True)
+
+    for seg_key, seg_label in [("setting","Practice Setting"),("specialty","Specialty"),("target","Target Type")]:
+        st.markdown(f'<div class="card"><div class="sec-lbl">{seg_label}</div>', unsafe_allow_html=True)
+
+        # Get all unique values for this segment
+        seg_vals = sorted(full_df[seg_key].dropna().unique().tolist())
+        if not seg_vals: continue
+
+        # Header
+        col_w = f"160px " + " ".join([f"80px"] * len(seg_vals))
+        header_html = f'<div style="display:grid;grid-template-columns:{col_w};font-size:10px;font-weight:600;color:#4a6080;letter-spacing:0.5px;text-transform:uppercase;padding:6px 8px;background:#0a1220;border-radius:6px;margin-bottom:4px"><span>Theme</span>'
+        for v in seg_vals:
+            header_html += f'<span style="text-align:center">{v[:12]}</span>'
+        header_html += '</div>'
+        st.markdown(header_html, unsafe_allow_html=True)
+
+        for theme, nss_overall, *_ in theme_nss:
+            sa = all_theme_results.get(theme)
+            if not sa: continue
+            seg_data = sa["seg_sentiment"].get(seg_key, {})
+            row_html = f'<div style="display:grid;grid-template-columns:{col_w};align-items:center;padding:5px 8px;border-bottom:1px solid #0f1823"><span style="font-size:11px;color:#e2ecf8">{theme}</span>'
+            for v in seg_vals:
+                d = seg_data.get(v)
+                if d:
+                    denom = d["pos"] + d["neg"] + d.get("neutral", 0)
+                    seg_nss = round((d["pos"] - d["neg"]) / denom * 100) if denom > 0 else 0
+                    nc = "#10b981" if seg_nss > 10 else "#ef4444" if seg_nss < -10 else "#f59e0b"
+                    warn = "⚠" if d.get("n_resp", 0) < 5 else ""
+                    row_html += f'<div style="text-align:center"><span style="font-family:monospace;font-size:12px;font-weight:700;color:{nc}">{seg_nss:+d}{warn}</span></div>'
+                else:
+                    row_html += '<div style="text-align:center;color:#2a3a55">—</div>'
+            row_html += '</div>'
+            st.markdown(row_html, unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Download as Excel ─────────────────────────────────────────────────
+    st.markdown('<div class="sec-lbl" style="margin-top:20px">⬇ DOWNLOAD SENTIMENT RESULTS</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:12px">Full sentiment data including all classified sentences, HCP-level NSS, and segment breakdowns — formatted Excel workbook.</div>', unsafe_allow_html=True)
+
+    if st.button("⬇ Generate & Download Sentiment Excel", key="dl_overall_excel"):
+        wb = Workbook()
+
+        def hcell(ws, r, c, v, bg="0B1F3A", fg="FFFFFF", bold=True, sz=10, align="center"):
+            cell = ws.cell(r, c, v)
+            cell.font = Font(name="Arial", bold=bold, color=fg, size=sz)
+            cell.fill = PatternFill("solid", fgColor=bg)
+            cell.alignment = Alignment(horizontal=align, vertical="center", wrap_text=True)
+            return cell
+
+        def dcell(ws, r, c, v, fg="1E293B", bold=False, sz=10, align="left", bg=None):
+            cell = ws.cell(r, c, v)
+            cell.font = Font(name="Arial", bold=bold, color=fg, size=sz)
+            if bg: cell.fill = PatternFill("solid", fgColor=bg)
+            cell.alignment = Alignment(horizontal=align, vertical="center", wrap_text=True)
+            return cell
+
+        # Sheet 1: Summary — all themes NSS
+        ws1 = wb.active; ws1.title = "Summary — All Themes"
+        ws1.sheet_view.showGridLines = False
+        headers = ["Theme","HCPs Mentioning","Total Sentences","Positive","Negative","Mixed","Neutral","NSS","NSS Label"]
+        for col, h in enumerate(headers, 1):
+            hcell(ws1, 1, col, h)
+        for i, (theme, nss, pos, neg, neu, mix, total_s, n_resp) in enumerate(theme_nss, 2):
+            nss_label = "Net positive" if nss > 10 else "Net negative" if nss < -10 else "Balanced"
+            bg = "ECFDF5" if nss > 10 else "FEF2F2" if nss < -10 else "FFFBEB"
+            fg_nss = "065F46" if nss > 10 else "7F1D1D" if nss < -10 else "92400E"
+            for col, v in enumerate([theme, n_resp, total_s, pos, neg, mix, neu], 1):
+                dcell(ws1, i, col, v, align="center")
+            dcell(ws1, i, 8, f"{nss:+d}", fg_nss, True, 10, "center", bg)
+            dcell(ws1, i, 9, nss_label, fg_nss, False, 10, "center", bg)
+            ws1.row_dimensions[i].height = 20
+        for col, w in zip(range(1,10), [22,14,14,10,10,10,10,10,14]):
+            ws1.column_dimensions[__import__("openpyxl").utils.get_column_letter(col)].width = w
+
+        # Sheet 2: All classified sentences
+        ws2 = wb.create_sheet("All Sentences")
+        ws2.sheet_view.showGridLines = False
+        sent_headers = ["Theme","HCP_ID","Practice Setting","Specialty","Target","Sentiment","Confidence","Positive Triggers","Negative Triggers","Full Sentence"]
+        for col, h in enumerate(sent_headers, 1):
+            hcell(ws2, 1, col, h, "0D9488")
+        row_idx = 2
+        sent_colors = {"POSITIVE":"ECFDF5","NEGATIVE":"FEF2F2","MIXED":"FFFBEB","NEUTRAL":None}
+        sent_fg = {"POSITIVE":"065F46","NEGATIVE":"7F1D1D","MIXED":"92400E","NEUTRAL":"334155"}
+        for theme, sa in all_theme_results.items():
+            for r in sa["all_results"]:
+                bg = sent_colors.get(r["sentiment"])
+                fg = sent_fg.get(r["sentiment"],"334155")
+                vals = [theme, r["id"], r["setting"], r["specialty"], r["target"],
+                        r["sentiment"], r["confidence"],
+                        ", ".join(r["pos_triggers"]), ", ".join(r["neg_triggers"]),
+                        r["sentence"]]
+                for col, v in enumerate(vals, 1):
+                    dcell(ws2, row_idx, col, v,
+                          fg if col==6 else "1E293B",
+                          col==6, 9, "left", bg if col==6 else None)
+                ws2.row_dimensions[row_idx].height = 30
+                row_idx += 1
+        for col, w in zip(range(1,11), [22,10,16,14,12,12,11,28,22,50]):
+            ws2.column_dimensions[__import__("openpyxl").utils.get_column_letter(col)].width = w
+
+        # Sheet 3: NSS by segment
+        ws3 = wb.create_sheet("NSS by Segment")
+        ws3.sheet_view.showGridLines = False
+        hcell(ws3, 1, 1, "NSS BY SEGMENT — ALL THEMES", "0B1F3A", merge_to=None)
+        r = 2
+        for seg_key, seg_label in [("setting","Practice Setting"),("specialty","Specialty"),("target","Target Type")]:
+            seg_vals = sorted(full_df[seg_key].dropna().unique().tolist())
+            hcell(ws3, r, 1, seg_label, "0D9488"); r+=1
+            hcell(ws3, r, 1, "Theme", "1E3A5F")
+            for ci, v in enumerate(seg_vals, 2):
+                hcell(ws3, r, ci, v[:20], "1E3A5F")
+            r+=1
+            for theme, *_ in theme_nss:
+                sa = all_theme_results.get(theme)
+                if not sa: continue
+                dcell(ws3, r, 1, theme, "0B1F3A", True, 10, "left")
+                for ci, v in enumerate(seg_vals, 2):
+                    d = sa["seg_sentiment"].get(seg_key, {}).get(v)
+                    if d:
+                        denom2 = d["pos"]+d["neg"]+d.get("neutral",0)
+                        sn = round((d["pos"]-d["neg"])/denom2*100) if denom2 else 0
+                        nc = "065F46" if sn>10 else "7F1D1D" if sn<-10 else "92400E"
+                        bg2 = "ECFDF5" if sn>10 else "FEF2F2" if sn<-10 else "FFFBEB"
+                        dcell(ws3, r, ci, f"{sn:+d}", nc, True, 10, "center", bg2)
+                    else:
+                        dcell(ws3, r, ci, "—", "CBD5E1", False, 10, "center")
+                ws3.row_dimensions[r].height = 20; r+=1
+            r+=1
+        ws3.column_dimensions["A"].width = 22
+        for ci in range(2, 10):
+            ws3.column_dimensions[__import__("openpyxl").utils.get_column_letter(ci)].width = 16
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        st.download_button(
+            "⬇ Download Sentiment_Results.xlsx",
+            buf.getvalue(),
+            "Sentiment_Results.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+
+def render_theme_sentiment(theme, full_df):
+    """
+    Sentiment view for a single theme — stats + NSS only.
+    No quotes on screen. Download only.
+    """
+    import io
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    with st.spinner(f"Running sentiment analysis for {theme}..."):
+        sa = run_sentiment_analysis(theme, full_df)
+
+    T_sents = sa["total_sentences"]
+    if T_sents == 0:
+        st.warning(f"No sentences referencing {theme} found.")
+        return
+
+    color = TC.get(theme, "#3b6ef7")
+    counts = sa["counts"]
+    pos_n = counts["POSITIVE"]; neg_n = counts["NEGATIVE"]
+    mix_n = counts["MIXED"];    neu_n = counts["NEUTRAL"]
+    denom = pos_n + neg_n + neu_n
+    nss = round((pos_n - neg_n) / denom * 100, 1) if denom > 0 else 0
+    nss_color = "#10b981" if nss > 10 else "#ef4444" if nss < -10 else "#f59e0b"
+    nss_label = "Net positive" if nss > 10 else "Net negative" if nss < -10 else "Balanced"
+
+    # Theme header
+    st.markdown(f'''<div style="background:#0d1420;border:1px solid #1a2640;border-radius:12px;padding:16px 20px;margin-bottom:16px;border-left:4px solid {color}">
+        <div style="font-size:10px;letter-spacing:2px;text-transform:uppercase;color:{color};font-weight:600;margin-bottom:4px;font-family:'IBM Plex Mono',monospace">SENTIMENT ANALYSIS</div>
+        <div style="font-size:22px;font-weight:700;color:#e2ecf8">{theme}</div>
+        <div style="font-size:11px;color:#4a6080;margin-top:4px">{T_sents} sentences from {sa["n_respondents"]} respondents · {len(full_df)} total in dataset</div>
+    </div>''', unsafe_allow_html=True)
+
+    # NSS score card
+    nss_interp = (f"Doctors broadly express favourable sentiment on {theme}."
+                  if nss > 10 else
+                  f"Concern or hesitation language outweighs positive on {theme}."
+                  if nss < -10 else
+                  f"Sentiment on {theme} is balanced — positive and negative roughly equal.")
+
+    st.markdown(f'''<div class="card" style="border-left:4px solid {nss_color};margin-bottom:16px">
+        <div style="display:flex;align-items:center;gap:24px;flex-wrap:wrap">
+            <div style="text-align:center;min-width:110px">
+                <div style="font-size:10px;color:{nss_color};font-weight:600;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px">Net Sentiment Score</div>
+                <div style="font-family:'IBM Plex Mono',monospace;font-size:44px;font-weight:700;color:{nss_color};line-height:1">{nss:+.1f}</div>
+                <div style="font-size:11px;color:{nss_color};margin-top:2px">{nss_label}</div>
+            </div>
+            <div style="flex:1;min-width:200px">
+                <div style="font-size:13px;color:#c8d4e8;line-height:1.6;margin-bottom:8px">{nss_interp}</div>
+                <div style="font-size:11px;color:#4a6080">Formula: (Positive − Negative) ÷ (Pos + Neg + Neutral) × 100<br>
+                ({pos_n} − {neg_n}) ÷ ({pos_n} + {neg_n} + {neu_n}) × 100 = <b style="color:{nss_color}">{nss:+.1f}</b></div>
+            </div>
+        </div>
+    </div>''', unsafe_allow_html=True)
+
+    # Stat cards
+    c1,c2,c3,c4 = st.columns(4)
+    for col, (label, count, col_c, desc) in zip([c1,c2,c3,c4], [
+        ("Positive", pos_n, "#10b981", "Favourable language"),
+        ("Negative", neg_n, "#ef4444", "Concern / hesitation"),
+        ("Mixed",    mix_n, "#f59e0b", "Both signals present"),
+        ("Neutral",  neu_n, "#64748b", "Clinical / factual"),
+    ]):
+        pct = round(count/T_sents*100) if T_sents else 0
+        col.markdown(f'''<div class="card" style="text-align:center;border-left:3px solid {col_c}">
+            <div style="font-size:10px;color:{col_c};font-weight:600;margin-bottom:4px;text-transform:uppercase">{label}</div>
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:28px;font-weight:600;color:{col_c}">{count}</div>
+            <div style="font-size:13px;color:#e2ecf8;margin-top:2px">{pct}%</div>
+            <div style="font-size:9px;color:#4a6080;margin-top:4px">{desc}</div>
+        </div>''', unsafe_allow_html=True)
+
+    # Sentiment bar
+    pos_pct = round(pos_n/T_sents*100) if T_sents else 0
+    neg_pct = round(neg_n/T_sents*100) if T_sents else 0
+    mix_pct = round(mix_n/T_sents*100) if T_sents else 0
+    neu_pct = 100 - pos_pct - neg_pct - mix_pct
+    st.markdown(f'''<div style="margin:14px 0">
+        <div style="font-size:11px;color:#4a6080;margin-bottom:5px">Sentence distribution — {T_sents} total</div>
+        <div style="display:flex;height:16px;border-radius:4px;overflow:hidden;gap:2px">
+            <div style="width:{pos_pct}%;background:#10b981"></div>
+            <div style="width:{neg_pct}%;background:#ef4444"></div>
+            <div style="width:{mix_pct}%;background:#f59e0b"></div>
+            <div style="flex:1;background:#1e293b"></div>
+        </div>
+        <div style="display:flex;gap:14px;margin-top:5px;font-size:11px">
+            <span style="color:#10b981">■ Positive {pos_pct}%</span>
+            <span style="color:#ef4444">■ Negative {neg_pct}%</span>
+            <span style="color:#f59e0b">■ Mixed {mix_pct}%</span>
+            <span style="color:#64748b">■ Neutral {neu_pct}%</span>
+        </div>
+    </div>''', unsafe_allow_html=True)
+
+    # Segment breakdown — stats + NSS, no quotes
+    st.markdown('<div class="sec-lbl" style="margin-top:16px">SENTIMENT BY SEGMENT</div>', unsafe_allow_html=True)
+
+    for seg_key, seg_label in [("setting","Practice Setting"),("specialty","Specialty"),("target","Target Type")]:
+        seg_data = sa["seg_sentiment"].get(seg_key, {})
+        if not seg_data: continue
+        st.markdown(f'''<div class="card" style="margin-bottom:14px">
+            <div class="sec-lbl" style="margin-bottom:12px">{seg_label}</div>
+            <div style="display:grid;grid-template-columns:160px 1fr 60px 60px 60px 70px 70px 90px;font-size:10px;font-weight:600;color:#4a6080;letter-spacing:0.5px;text-transform:uppercase;padding:4px 0;border-bottom:1px solid #1a2640;margin-bottom:6px">
+                <span>Segment</span><span>Sentiment bar</span>
+                <span style="text-align:center">HCPs</span>
+                <span style="text-align:center">Pos</span>
+                <span style="text-align:center">Neg</span>
+                <span style="text-align:center">Neutral</span>
+                <span style="text-align:center">Sentences</span>
+                <span style="text-align:center">NSS</span>
+            </div>''', unsafe_allow_html=True)
+
+        for val, d in sorted(seg_data.items(), key=lambda x: -(x[1]["pos"]+x[1]["neg"])):
+            vt = d["total"]
+            if vt == 0: continue
+            pos2=d["pos"]; neg2=d["neg"]; mix2=d.get("mixed",0); neu2=d.get("neutral",0)
+            n_resp2=d.get("n_resp",0)
+            p=round(pos2/vt*100); n=round(neg2/vt*100); m=round(mix2/vt*100)
+            denom2=pos2+neg2+neu2
+            sn=round((pos2-neg2)/denom2*100) if denom2 else 0
+            nc="#10b981" if sn>10 else "#ef4444" if sn<-10 else "#f59e0b"
+            nl="Net +" if sn>10 else "Net −" if sn<-10 else "Balanced"
+            warn="⚠" if n_resp2<5 or vt<10 else ""
+            pos_s=f"{p}%" if p>0 else "—"; neg_s=f"{n}%" if n>0 else "—"
+            st.markdown(f'''<div style="display:grid;grid-template-columns:160px 1fr 60px 60px 60px 70px 70px 90px;align-items:center;padding:7px 0;border-bottom:1px solid #0f1823">
+                <div style="font-size:12px;color:#e2ecf8;font-weight:500">{val[:22]}{warn}</div>
+                <div style="display:flex;height:10px;border-radius:3px;overflow:hidden;gap:2px;margin-right:8px;background:#1e293b">
+                    <div style="width:{p}%;background:#10b981"></div>
+                    <div style="width:{n}%;background:#ef4444"></div>
+                    <div style="width:{m}%;background:#f59e0b"></div>
+                </div>
+                <div style="text-align:center"><div style="font-size:13px;color:#e2ecf8;font-weight:500">{n_resp2}</div><div style="font-size:9px;color:#4a6080">HCPs</div></div>
+                <div style="text-align:center;font-size:12px;color:#10b981">{pos_s}</div>
+                <div style="text-align:center;font-size:12px;color:{"#ef4444" if n>0 else "#4a6080"}">{neg_s}</div>
+                <div style="text-align:center;font-size:12px;color:#4a6080">{neu2}</div>
+                <div style="text-align:center"><div style="font-size:13px;color:#64748b">{vt}</div><div style="font-size:9px;color:#4a6080">sent.</div></div>
+                <div style="text-align:center">
+                    <span style="font-family:'IBM Plex Mono',monospace;font-size:14px;font-weight:700;color:{nc}">{sn:+d}</span>
+                    <div style="font-size:9px;color:{nc}">{nl}</div>
+                </div>
+            </div>''', unsafe_allow_html=True)
+
+        # Calculation workings
+        st.markdown('<div style="margin-top:10px;border-top:1px solid #1a2640;padding-top:10px">', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:10px;font-weight:600;color:#4a6080;letter-spacing:1px;text-transform:uppercase;margin-bottom:6px">NSS calculation workings</div>', unsafe_allow_html=True)
+        st.markdown('''<div style="display:grid;grid-template-columns:160px 50px 50px 50px 50px 1fr 80px;font-size:9px;font-weight:600;color:#4a6080;text-transform:uppercase;padding:4px 8px;background:#0a1220;border-radius:6px 6px 0 0">
+            <span>Segment</span><span style="text-align:center">Pos</span><span style="text-align:center">Neg</span>
+            <span style="text-align:center">Neutral</span><span style="text-align:center">Total</span>
+            <span style="text-align:center">Formula</span><span style="text-align:center">NSS</span>
+        </div>''', unsafe_allow_html=True)
+        small_segs=[]
+        for val, d in sorted(seg_data.items(), key=lambda x: -(x[1]["pos"]+x[1]["neg"])):
+            vt=d["total"]
+            if vt==0: continue
+            pos2=d["pos"]; neg2=d["neg"]; neu2=d.get("neutral",0)
+            denom2=pos2+neg2+neu2
+            sn=round((pos2-neg2)/denom2*100) if denom2 else 0
+            nc="#10b981" if sn>10 else "#ef4444" if sn<-10 else "#f59e0b"
+            formula=f"({pos2}−{neg2})÷({pos2}+{neg2}+{neu2})×100 = {pos2-neg2}÷{denom2}×100"
+            n_resp2=d.get("n_resp",0)
+            if n_resp2<5 or vt<10: small_segs.append(val)
+            st.markdown(f'''<div style="display:grid;grid-template-columns:160px 50px 50px 50px 50px 1fr 80px;font-size:11px;align-items:center;padding:5px 8px;border-bottom:1px solid #0f1823;background:#0d1420">
+                <span style="color:#c8d4e8;font-weight:500">{val[:22]}</span>
+                <span style="text-align:center;color:#10b981;font-family:'IBM Plex Mono',monospace">{pos2}</span>
+                <span style="text-align:center;color:{"#ef4444" if neg2>0 else "#4a6080"};font-family:'IBM Plex Mono',monospace">{neg2}</span>
+                <span style="text-align:center;color:#4a6080;font-family:'IBM Plex Mono',monospace">{neu2}</span>
+                <span style="text-align:center;color:#64748b;font-family:'IBM Plex Mono',monospace">{denom2}</span>
+                <span style="color:#64748b;font-size:10px;font-family:'IBM Plex Mono',monospace">{formula}</span>
+                <span style="text-align:center;font-family:'IBM Plex Mono',monospace;font-weight:700;color:{nc}">{sn:+d}</span>
+            </div>''', unsafe_allow_html=True)
+        if small_segs:
+            st.markdown(f'<div style="font-size:10px;color:#f59e0b;padding:6px 8px;background:#1a1200;border-radius:0 0 6px 6px">⚠ Small sample: {", ".join(small_segs[:3])} — treat directionally (n&lt;5 HCPs or &lt;10 sentences)</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="height:4px;background:#0a1220;border-radius:0 0 6px 6px"></div>', unsafe_allow_html=True)
+        st.markdown('</div></div>', unsafe_allow_html=True)
+
+    # NSS methodology note
+    st.markdown(f'''<div class="card" style="border-left:3px solid #3b6ef7;margin-top:4px">
+        <div class="sec-lbl">HOW NSS WAS CALCULATED</div>
+        <div style="font-size:12px;color:#c8d4e8;line-height:1.75">
+            Each SPEAKER_B response split into sentences → sentences referencing <b>{theme}</b> identified →
+            each sentence classified Positive / Negative / Mixed / Neutral using a pharma-tuned lexicon
+            with negation detection and context overrides →
+            NSS = (Positive − Negative) ÷ (Pos + Neg + Neutral) × 100.
+        </div>
+        <div style="margin-top:8px;font-size:11px;color:#4a6080">
+            Score ranges: <b style="color:#10b981">+10 to +100</b> = Net positive ·
+            <b style="color:#f59e0b">-10 to +10</b> = Balanced ·
+            <b style="color:#ef4444">-100 to -10</b> = Net negative
+        </div>
+    </div>''', unsafe_allow_html=True)
+
+    # Download button — Excel
+    st.markdown('<div class="sec-lbl" style="margin-top:20px">⬇ DOWNLOAD SENTIMENT DATA</div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="font-size:11px;color:#4a6080;margin-bottom:10px">Classified sentences, HCP-level NSS, and segment breakdown for {theme}. No quotes shown on screen — all in the Excel.</div>', unsafe_allow_html=True)
+
+    if st.button(f"⬇ Generate & Download {theme} Sentiment Excel", key=f"dl_theme_{theme}"):
+        import io
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+
+        wb = Workbook()
+
+        def hc(ws,r,c,v,bg="0B1F3A",fg="FFFFFF",bold=True,sz=10):
+            cell=ws.cell(r,c,v); cell.font=Font(name="Arial",bold=bold,color=fg,size=sz)
+            cell.fill=PatternFill("solid",fgColor=bg); cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+            return cell
+        def dc(ws,r,c,v,fg="1E293B",bold=False,sz=10,align="left",bg=None):
+            cell=ws.cell(r,c,v); cell.font=Font(name="Arial",bold=bold,color=fg,size=sz)
+            if bg: cell.fill=PatternFill("solid",fgColor=bg)
+            cell.alignment=Alignment(horizontal=align,vertical="center",wrap_text=True)
+            return cell
+
+        sent_colors={"POSITIVE":"ECFDF5","NEGATIVE":"FEF2F2","MIXED":"FFFBEB","NEUTRAL":None}
+        sent_fg={"POSITIVE":"065F46","NEGATIVE":"7F1D1D","MIXED":"92400E","NEUTRAL":"334155"}
+
+        # Sheet 1: All sentences
+        ws1=wb.active; ws1.title="All Sentences"
+        ws1.sheet_view.showGridLines=False
+        for col,h in enumerate(["HCP_ID","Practice Setting","Specialty","Target","Sentiment","Confidence","Positive Triggers","Negative Triggers","Full Sentence"],1):
+            hc(ws1,1,col,h,"0D9488")
+        for ri,r in enumerate(sa["all_results"],2):
+            bg=sent_colors.get(r["sentiment"]); fg2=sent_fg.get(r["sentiment"],"334155")
+            vals=[r["id"],r["setting"],r["specialty"],r["target"],r["sentiment"],r["confidence"],", ".join(r["pos_triggers"]),", ".join(r["neg_triggers"]),r["sentence"]]
+            for col,v in enumerate(vals,1):
+                dc(ws1,ri,col,v,fg2 if col==5 else "1E293B",col==5,9,"left",bg if col==5 else None)
+            ws1.row_dimensions[ri].height=30
+        for col,w in zip(range(1,10),[10,16,14,12,12,11,28,22,55]):
+            ws1.column_dimensions[__import__("openpyxl").utils.get_column_letter(col)].width=w
+
+        # Sheet 2: HCP NSS summary
+        ws2=wb.create_sheet("HCP NSS Summary")
+        ws2.sheet_view.showGridLines=False
+        hcp_data={}
+        for r in sa["all_results"]:
+            hid=r["id"]
+            if hid not in hcp_data:
+                hcp_data[hid]={"id":hid,"setting":r["setting"],"specialty":r["specialty"],"target":r["target"],"pos":0,"neg":0,"mix":0,"neu":0}
+            hcp_data[hid][{"POSITIVE":"pos","NEGATIVE":"neg","MIXED":"mix","NEUTRAL":"neu"}.get(r["sentiment"],"neu")]+=1
+        for col,h in enumerate(["HCP_ID","Practice Setting","Specialty","Target","Positive","Negative","Mixed","Neutral","Total","NSS","NSS Label"],1):
+            hc(ws2,1,col,h,"0D9488")
+        hcp_list=[]
+        for h in hcp_data.values():
+            tot=h["pos"]+h["neg"]+h["mix"]+h["neu"]
+            denom2=h["pos"]+h["neg"]+h["neu"]
+            hn=round((h["pos"]-h["neg"])/denom2*100,1) if denom2 else 0
+            hl="Net positive" if hn>10 else "Net negative" if hn<-10 else "Balanced"
+            hcp_list.append((h,hn,hl,tot))
+        hcp_list.sort(key=lambda x:-x[1])
+        for ri,(h,hn,hl,tot) in enumerate(hcp_list,2):
+            bg2="ECFDF5" if hn>10 else "FEF2F2" if hn<-10 else "FFFBEB"
+            fg3="065F46" if hn>10 else "7F1D1D" if hn<-10 else "92400E"
+            for col,v in enumerate([h["id"],h["setting"],h["specialty"],h["target"],h["pos"],h["neg"],h["mix"],h["neu"],tot],1):
+                dc(ws2,ri,col,v,"1E293B",False,10,"center")
+            dc(ws2,ri,10,f"{hn:+.1f}",fg3,True,11,"center",bg2)
+            dc(ws2,ri,11,hl,fg3,False,10,"center",bg2)
+            ws2.row_dimensions[ri].height=20
+        for col,w in zip(range(1,12),[12,18,14,12,10,10,10,10,10,12,14]):
+            ws2.column_dimensions[__import__("openpyxl").utils.get_column_letter(col)].width=w
+
+        # Sheet 3: Segment NSS
+        ws3=wb.create_sheet("Segment NSS")
+        ws3.sheet_view.showGridLines=False
+        r3=1
+        for seg_key,seg_label in [("setting","Practice Setting"),("specialty","Specialty"),("target","Target Type")]:
+            hc(ws3,r3,1,seg_label,"1E3A5F"); r3+=1
+            for col,h in enumerate(["Segment","HCPs","Total Sentences","Positive","Negative","Neutral","NSS","NSS Label"],1):
+                hc(ws3,r3,col,h,"0D9488"); 
+            r3+=1
+            for val,d in sorted(sa["seg_sentiment"].get(seg_key,{}).items(),key=lambda x:-(x[1]["pos"]+x[1]["neg"])):
+                vt=d["total"]; pos2=d["pos"]; neg2=d["neg"]; neu2=d.get("neutral",0)
+                denom2=pos2+neg2+neu2; sn=round((pos2-neg2)/denom2*100,1) if denom2 else 0
+                sl2="Net positive" if sn>10 else "Net negative" if sn<-10 else "Balanced"
+                bg3="ECFDF5" if sn>10 else "FEF2F2" if sn<-10 else "FFFBEB"
+                fg4="065F46" if sn>10 else "7F1D1D" if sn<-10 else "92400E"
+                for col,v in enumerate([val,d.get("n_resp",0),vt,pos2,neg2,neu2],1):
+                    dc(ws3,r3,col,v,"1E293B",False,10,"center")
+                dc(ws3,r3,7,f"{sn:+.1f}",fg4,True,11,"center",bg3)
+                dc(ws3,r3,8,sl2,fg4,False,10,"center",bg3)
+                ws3.row_dimensions[r3].height=20; r3+=1
+            r3+=1
+        for col,w in zip(range(1,9),[22,10,14,10,10,10,12,14]):
+            ws3.column_dimensions[__import__("openpyxl").utils.get_column_letter(col)].width=w
+
+        buf=io.BytesIO(); wb.save(buf); buf.seek(0)
+        st.download_button(
+            f"⬇ Download {theme}_Sentiment.xlsx",
+            buf.getvalue(),
+            f"{theme.replace('/','_')}_Sentiment.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+
+
 def render_dashboard(theme, full_df):
     pats = THEMES.get(theme, [theme.lower()])
     theme_df = full_df[full_df["text_lower"].apply(lambda x: any(p in x for p in pats))]
@@ -1196,7 +1749,7 @@ def render_dashboard(theme, full_df):
         st.warning(f"No respondents mentioned {theme} in the uploaded data.")
         return
 
-    tab1, tab2, tab3, tab4 = st.tabs(["📋  Dashboard Summary", "🎭  Sentiment Analysis", "💬  Quotes & Evidence", "⬇  Download"])
+    tab1, tab2, tab3 = st.tabs(["📋  Dashboard Summary", "💬  Quotes & Evidence", "⬇  Download"])
 
     with tab1:
         # Stat row
@@ -1254,9 +1807,6 @@ def render_dashboard(theme, full_df):
         st.markdown('</div>', unsafe_allow_html=True)
 
     with tab2:
-        render_sentiment_tab(theme, full_df)
-
-    with tab3:
         all_settings = ["All"] + sorted(theme_df["setting"].dropna().unique().tolist())
         filter_s = st.selectbox("Filter by Setting", all_settings, key=f"ds_{theme}")
         disp = theme_df if filter_s == "All" else theme_df[theme_df["setting"] == filter_s]
@@ -1264,7 +1814,7 @@ def render_dashboard(theme, full_df):
         for _, row in disp.iterrows():
             quote_card(row, focus=[theme])
 
-    with tab4:
+    with tab3:
         export_rows = []
         for _, row in theme_df.iterrows():
             others = [t for t,p2 in THEMES.items() if t!=theme and any(p in row["text_lower"] for p in p2)]
@@ -1341,16 +1891,17 @@ with st.sidebar:
     st.markdown(f'<div class="card" style="text-align:center;margin-top:6px"><div class="stat-num">{fn}</div><div class="stat-lbl">in view</div><div style="font-size:11px;margin-top:6px">{sh}</div></div>', unsafe_allow_html=True)
     st.markdown("<hr>", unsafe_allow_html=True)
 
-    # ── TWO-TAB SIDEBAR ──────────────────────────────────────────────────────
-    side_tab1, side_tab2 = st.tabs(["📊  Dashboard", "❓  Questions"])
+    # ── THREE-TAB SIDEBAR ─────────────────────────────────────────────────────
+    side_tab1, side_tab2, side_tab3 = st.tabs(["📊 Dashboard", "❓ Questions", "🎭 Sentiment"])
 
     with side_tab1:
-        st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:10px;line-height:1.6;margin-top:8px">Click any theme for a full dashboard — executive summary, segment breakdown, quotes and downloads.</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:10px;margin-top:8px;line-height:1.6">Click any theme for the full dashboard — executive summary, segment breakdown, quotes.</div>', unsafe_allow_html=True)
         for theme_name in list(THEMES.keys()):
-            color = TC.get(theme_name, "#3b6ef7")
             if st.button(f"● {theme_name}", key=f"dash_{theme_name}"):
                 st.session_state["dashboard_theme"] = theme_name
                 st.session_state["q"] = ""
+                st.session_state["sent_theme"] = ""
+                st.session_state["sent_overall"] = False
                 st.rerun()
 
     with side_tab2:
@@ -1361,18 +1912,59 @@ with st.sidebar:
                     if st.button(q, key=f"qb_{q[:28]}"):
                         st.session_state["q"] = q
                         st.session_state["dashboard_theme"] = ""
+                        st.session_state["sent_theme"] = ""
+                        st.session_state["sent_overall"] = False
                         st.rerun()
+
+    with side_tab3:
+        st.markdown('<div style="font-size:11px;color:#4a6080;margin-bottom:10px;margin-top:8px;line-height:1.6">Sentiment analysis — stats and NSS only. All quotes downloadable as Excel.</div>', unsafe_allow_html=True)
+        # Overall view button
+        if st.button("🌐  All themes — overview", key="sent_overall_btn"):
+            st.session_state["sent_overall"] = True
+            st.session_state["sent_theme"] = ""
+            st.session_state["dashboard_theme"] = ""
+            st.session_state["q"] = ""
+            st.rerun()
+        st.markdown("<hr>", unsafe_allow_html=True)
+        st.markdown('<div style="font-size:10px;color:#4a6080;letter-spacing:1px;text-transform:uppercase;margin-bottom:6px">By theme</div>', unsafe_allow_html=True)
+        for theme_name in list(THEMES.keys()):
+            if st.button(f"● {theme_name}", key=f"sent_{theme_name}"):
+                st.session_state["sent_theme"] = theme_name
+                st.session_state["sent_overall"] = False
+                st.session_state["dashboard_theme"] = ""
+                st.session_state["q"] = ""
+                st.rerun()
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if "q" not in st.session_state: st.session_state["q"] = ""
 if "dashboard_theme" not in st.session_state: st.session_state["dashboard_theme"] = ""
+if "sent_theme" not in st.session_state: st.session_state["sent_theme"] = ""
+if "sent_overall" not in st.session_state: st.session_state["sent_overall"] = False
+
+def back_btn(label="← Back"):
+    if st.button(label, key="back_btn"):
+        st.session_state["dashboard_theme"] = ""
+        st.session_state["sent_theme"] = ""
+        st.session_state["sent_overall"] = False
+        st.session_state["q"] = ""
+        st.rerun()
+
+# ── SENTIMENT OVERALL MODE ────────────────────────────────────────────────────
+if st.session_state.get("sent_overall"):
+    back_btn("← Back to search")
+    render_overall_sentiment(full_df)
+    st.stop()
+
+# ── SENTIMENT THEME MODE ──────────────────────────────────────────────────────
+if st.session_state.get("sent_theme") and not st.session_state.get("q"):
+    back_btn("← Back to search")
+    render_theme_sentiment(st.session_state["sent_theme"], full_df)
+    st.stop()
 
 # ── DASHBOARD MODE ────────────────────────────────────────────────────────────
 if st.session_state.get("dashboard_theme") and not st.session_state.get("q"):
     theme_selected = st.session_state["dashboard_theme"]
-    if st.button("← Back to search", key="back_btn"):
-        st.session_state["dashboard_theme"] = ""
-        st.rerun()
+    back_btn("← Back to search")
     render_dashboard(theme_selected, full_df)
     st.stop()
 
