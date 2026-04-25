@@ -227,29 +227,64 @@ def load_excel(file):
 
     # ── Step 6: extract doctor-only speech ────────────────────────────────────
     def doctor_text(t):
-        # SPEAKER_B — strict extraction, HCP responses only
-        lines = re.findall(r'SPEAKER_B:\s*(.+?)(?=SPEAKER_A:|SPEAKER_B:|\Z)', t, re.DOTALL)
-        cleaned = [re.sub(r'\s+', ' ', l).strip() for l in lines if len(l.strip()) > 15]
-        result = ' '.join(cleaned)
-        if len(result) > 50:
-            return result
-        # Doctor: pattern (some transcripts use this label instead)
-        lines2 = re.findall(r'Doctor:\s*(.+?)(?=AI Moderator:|Doctor:|\Z)', t, re.DOTALL)
-        cleaned2 = [re.sub(r'\s+', ' ', l).strip() for l in lines2 if len(l.strip()) > 15]
-        result2 = ' '.join(cleaned2)
-        if len(result2) > 50:
-            return result2
-        # HCP: pattern
-        lines3 = re.findall(r'HCP:\s*(.+?)(?=Moderator:|HCP:|\Z)', t, re.DOTALL)
-        cleaned3 = [re.sub(r'\s+', ' ', l).strip() for l in lines3 if len(l.strip()) > 15]
-        result3 = ' '.join(cleaned3)
-        if len(result3) > 50:
-            return result3
-        # Last resort: strip ALL Speaker A / moderator lines and keep the rest
-        # Remove SPEAKER_A, AI Moderator, Moderator lines entirely
-        stripped = re.sub(r'(SPEAKER_A|AI Moderator|Moderator):\s*.+?(?=SPEAKER_B:|Doctor:|HCP:|\Z)', '', t, flags=re.DOTALL)
-        stripped = re.sub(r'\s+', ' ', stripped).strip()
-        return stripped if len(stripped) > 30 else t
+        """
+        Auto-detect which speaker is the doctor vs the AI moderator.
+        Moderators use greeting/question phrases; doctors give clinical answers.
+        Handles both SPEAKER_A=moderator and SPEAKER_B=moderator cases.
+        """
+        MOD_PHRASES = [
+            'thank you', 'could you', 'when you', 'what specific', 'how do you',
+            'to start,', 'are you still there', 'i am here to understand',
+            "i'm here to understand", 'hello doctor', 'hello,', 'hello.',
+            'that is helpful', 'great,', 'understood.', 'i see,', 'interesting,',
+            'can you elaborate', 'could you clarify', 'could you describe',
+            'what are the primary', 'what factors', 'how does', 'how would you',
+            'in your experience', 'to confirm', 'so to confirm', 'you mentioned',
+            'i did not quite catch', 'please clarify', 'tell me more',
+        ]
+
+        # Extract SPEAKER_A and SPEAKER_B chunks
+        b_chunks = re.findall(r'SPEAKER_B:\s*(.+?)(?=SPEAKER_A:|SPEAKER_B:|\Z)', t, re.DOTALL)
+        a_chunks = re.findall(r'SPEAKER_A:\s*(.+?)(?=SPEAKER_A:|SPEAKER_B:|\Z)', t, re.DOTALL)
+
+        b_text = ' '.join(b_chunks).lower()
+        a_text = ' '.join(a_chunks).lower()
+
+        # Score each speaker — higher = more likely to be moderator
+        b_mod_score = sum(1 for p in MOD_PHRASES if p in b_text)
+        a_mod_score = sum(1 for p in MOD_PHRASES if p in a_text)
+
+        # Doctor is the speaker with LOWER moderator score
+        if a_chunks and b_chunks:
+            if b_mod_score > a_mod_score:
+                # SPEAKER_B is moderator → SPEAKER_A is doctor
+                doctor_chunks = a_chunks
+            else:
+                # SPEAKER_A is moderator → SPEAKER_B is doctor (most common)
+                doctor_chunks = b_chunks
+            cleaned = [re.sub(r'\s+', ' ', l).strip() for l in doctor_chunks if len(l.strip()) > 15]
+            result = ' '.join(cleaned)
+            if len(result) > 30:
+                return result
+        elif b_chunks:
+            cleaned = [re.sub(r'\s+', ' ', l).strip() for l in b_chunks if len(l.strip()) > 15]
+            result = ' '.join(cleaned)
+            if len(result) > 30:
+                return result
+
+        # Doctor: / HCP: label patterns
+        for pattern, stop in [
+            (r'Doctor:\s*(.+?)(?=AI Moderator:|Doctor:|\Z)', None),
+            (r'HCP:\s*(.+?)(?=Moderator:|HCP:|\Z)', None),
+        ]:
+            lines = re.findall(pattern, t, re.DOTALL)
+            cleaned = [re.sub(r'\s+', ' ', l).strip() for l in lines if len(l.strip()) > 15]
+            result = ' '.join(cleaned)
+            if len(result) > 30:
+                return result
+
+        # Absolute last resort: return as-is (better than empty)
+        return re.sub(r'\s+', ' ', t).strip()
 
     out["text"]       = out["text"].apply(doctor_text)
     out["text_lower"] = out["text"].str.lower()
